@@ -1,0 +1,13 @@
+# Tag images and dumps
+*.bin
+*.ndef
+
+# PowerShell / build
+*.zip
+.vscode/
+TestResults.xml
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store
