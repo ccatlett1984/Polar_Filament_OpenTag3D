@@ -29,7 +29,7 @@ function Invoke-OpenTag3DGuiAction {
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)] [ValidateSet('export','write','read','load','apply')] [string]$Action,
+        [Parameter(Mandatory)] [ValidateSet('export','write','read','load','apply','profile')] [string]$Action,
         [Parameter(Mandatory)] [AllowEmptyString()] [string]$Body,
         [Parameter(Mandatory)] [bool]$CanWrite
     )
@@ -38,9 +38,18 @@ function Invoke-OpenTag3DGuiAction {
     try { $r = $Body | ConvertFrom-Json }
     catch { return @{ ok = $false; message = 'Malformed request.' } }
 
-    # --- load: fetch or read a payload and return it as editable fields ---
+    # --- load: fetch, read or build a payload and return it as editable fields ---
     if ($Action -eq 'load') {
         try {
+            $mode = if ("$($r.mode)" -in 'Core','Extended') { "$($r.mode)" }
+                    elseif ($r.tagType -eq 'NTAG213') { 'Core' }
+                    else { 'Extended' }
+
+            # A hand-built tag has no lookup behind it, so its serial is the vendor's own
+            # batch id and stays editable. A Polar payload keeps the serial locked: it is
+            # the key the data came from.
+            $generic = $false
+
             if ($r.source -eq 'tag') {
                 if (-not $CanWrite) { return @{ ok = $false; message = 'No PC/SC reader available.' } }
                 $p = @{}
@@ -48,9 +57,19 @@ function Invoke-OpenTag3DGuiAction {
                 $tag = Read-OpenTag3DTag @p -Raw
                 $payload = $tag.PayloadBytes
             }
+            elseif ($r.source -eq 'new') {
+                $generic = $true
+                $payload = New-OpenTag3DBlankPayload -Mode $mode
+            }
+            elseif ($r.source -eq 'profile') {
+                $generic = $true
+                if ([string]::IsNullOrWhiteSpace($r.profileName)) { return @{ ok = $false; message = 'Choose a profile to load.' } }
+                $prof    = Get-OpenTag3DProfile -Name $r.profileName
+                if (-not ("$($r.mode)" -in 'Core','Extended')) { $mode = $prof.Mode }
+                $payload = New-OpenTag3DGenericPayload -Values $prof.Values -Mode $mode
+            }
             else {
                 if ([string]::IsNullOrWhiteSpace($r.serial)) { return @{ ok = $false; message = 'Enter a spool serial.' } }
-                $mode = if ($r.mode) { $r.mode } elseif ($r.tagType -eq 'NTAG213') { 'Core' } else { 'Extended' }
                 $img  = Export-OpenTag3DPayload -TagType $r.tagType -Serial $r.serial -Mode $mode -Format Ndef -OutputDir ([IO.Path]::GetTempPath()) -InformationAction SilentlyContinue -WarningAction SilentlyContinue 6>&1 | Out-Null
                 # Re-read what was just written, then clean it up: the lookup only serves files.
                 $file = Join-Path ([IO.Path]::GetTempPath()) "$($r.serial.ToUpperInvariant())-$($r.tagType)-$mode-Ndef.bin"
@@ -58,24 +77,51 @@ function Invoke-OpenTag3DGuiAction {
                 Remove-Item $file -Force -ErrorAction SilentlyContinue
             }
 
-            $decoded = ConvertFrom-OpenTag3DPayload -Payload $payload
-            $editable = foreach ($f in $script:OpenTag3DFields) {
-                $row = $decoded.Fields | Where-Object Id -eq $f.Id
-                @{
-                    id       = $f.Id
-                    name     = $f.Name
-                    value    = if ($row) { "$($row.Value)" } else { '' }
-                    section  = if ($f.Ext) { 'Extended' } else { 'Core' }
-                    type     = $f.Type
-                    unit     = if ($f.Unit) { $f.Unit } else { '' }
-                    readonly = ($f.Id -in $script:OpenTag3DReadOnly)
-                }
+            $editable = @(Get-OpenTag3DEditableField -Payload $payload -AllowSerial:$generic -BlankUnset:$generic)
+
+            $byId = @{}
+            foreach ($e in $editable) { $byId[$e.id] = $e.value }
+            $title = (@($byId['material'], $byId['material_mod'], $byId['color_name']) |
+                        Where-Object { $_ }) -join " $([char]0x00B7) "
+            if (-not $title) {
+                $title = if ($r.source -eq 'profile') { "Profile $([char]0x00B7) $($r.profileName)" }
+                         elseif ($generic) { 'New tag (generic vendor)' }
+                         else { 'Tag data' }
             }
+
             return @{
                 ok         = $true
                 fields     = @($editable)
                 payloadHex = ([BitConverter]::ToString($payload) -replace '-')
-                title      = (@($decoded.material, $decoded.material_mod, $decoded.color_name) | Where-Object { $_ }) -join " $([char]0x00B7) "
+                generic    = $generic
+                mode       = $mode
+                title      = $title
+            }
+        }
+        catch { return @{ ok = $false; message = $_.Exception.Message } }
+    }
+
+    # --- profile: list, save and delete saved vendor profiles ---
+    if ($Action -eq 'profile') {
+        try {
+            switch ("$($r.op)") {
+                'list' { return @{ ok = $true; profiles = @(Get-OpenTag3DProfileList) } }
+                'save' {
+                    $values = @{}
+                    if ($r.values) {
+                        foreach ($kv in $r.values.PSObject.Properties) { $values[$kv.Name] = $kv.Value }
+                    }
+                    if ($values.Count -eq 0) { return @{ ok = $false; message = 'Nothing to save.' } }
+                    $mode = if ("$($r.mode)" -in 'Core','Extended') { "$($r.mode)" } else { 'Extended' }
+                    $type = if ("$($r.tagType)" -in 'NTAG213','NTAG215','NTAG216') { "$($r.tagType)" } else { 'NTAG215' }
+                    $path = Save-OpenTag3DProfile -Name "$($r.name)" -Values $values -TagType $type -Mode $mode
+                    return @{ ok = $true; message = "Saved profile to $path"; profiles = @(Get-OpenTag3DProfileList); name = "$($r.name)" }
+                }
+                'delete' {
+                    Remove-OpenTag3DProfile -Name "$($r.name)"
+                    return @{ ok = $true; message = "Deleted profile '$($r.name)'."; profiles = @(Get-OpenTag3DProfileList) }
+                }
+                default { return @{ ok = $false; message = "Unknown profile operation '$($r.op)'." } }
             }
         }
         catch { return @{ ok = $false; message = $_.Exception.Message } }
@@ -90,19 +136,24 @@ function Invoke-OpenTag3DGuiAction {
             for ($i = 0; $i -lt $base.Length; $i++) { $base[$i] = [Convert]::ToByte($hex.Substring($i*2,2),16) }
 
             # Read-only fields are enforced here, not just disabled in the browser: a hand-made
-            # request must not be able to rewrite the serial.
+            # request must not be able to rewrite the serial on a payload that came from a
+            # lookup. A hand-built tag owns its serial, so only the tag version is fixed.
+            $readOnly = if ($r.generic) { $script:OpenTag3DGenericReadOnly } else { $script:OpenTag3DReadOnly }
             $values = @{}
             foreach ($kv in $r.values.PSObject.Properties) {
-                if ($kv.Name -in $script:OpenTag3DReadOnly) { continue }
+                if ($kv.Name -in $readOnly) { continue }
                 $values[$kv.Name] = $kv.Value
             }
 
+            # Encode once, untruncated: the truncation preview, the payload written and the
+            # file name all come from this.
+            $full = ConvertTo-OpenTag3DPayload -BasePayload $base -Values $values -WarningAction SilentlyContinue
+
             # NTAG213 holds Core only; cut the payload at 0x70. Anything populated above that
             # address is lost, so say what will go and require an explicit confirmation.
-            $truncate = if ($r.tagType -eq 'NTAG213') { 112 } else { 0 }
+            $truncate = if ($r.tagType -eq 'NTAG213' -and $full.Length -gt 112) { 112 } else { 0 }
             if ($truncate) {
-                $encoded  = ConvertTo-OpenTag3DPayload -BasePayload $base -Values $values -WarningAction SilentlyContinue
-                $all      = @(ConvertFrom-OpenTag3DPayload -Payload $encoded | Select-Object -ExpandProperty Fields)
+                $all      = @(ConvertFrom-OpenTag3DPayload -Payload $full | Select-Object -ExpandProperty Fields)
                 $dropping = @($all | Where-Object { $_.Section -eq 'Extended' })
                 $keeping  = @($all | Where-Object { $_.Section -eq 'Core' })
                 if ($dropping.Count -and -not $r.confirmTruncate) {
@@ -115,7 +166,7 @@ function Invoke-OpenTag3DGuiAction {
                     }
                 }
             }
-            $payload = ConvertTo-OpenTag3DPayload -BasePayload $base -Values $values -TruncateTo $truncate -WarningAction SilentlyContinue
+            $payload = if ($truncate) { [byte[]]$full[0..($truncate - 1)] } else { $full }
 
             $record = New-OpenTag3DNdefRecord -Payload $payload
             $image  = New-OpenTag3DImage -Data $record -TagType $r.tagType -Format Ndef
@@ -133,9 +184,14 @@ function Invoke-OpenTag3DGuiAction {
                 return @{ ok = $false; message = "Output directory not found: $dir" }
             }
             # Name from the untruncated payload: an NTAG213 cut at 0x70 has no serial field.
-            $decoded = ConvertFrom-OpenTag3DPayload -Payload $base
-            $name = if ($decoded.serial) { $decoded.serial } else { 'opentag3d' }
-            $path = Join-Path $dir "$name-$($r.tagType)-Edited-Ndef.bin"
+            $decoded = ConvertFrom-OpenTag3DPayload -Payload $full
+            $parts = if ($decoded.serial) { @($decoded.serial) }
+                     else { @($decoded.manufacturer, $decoded.material, $decoded.color_name) }
+            $name = (@($parts | Where-Object { $_ }) -join '-')
+            $name = ($name -replace '[^A-Za-z0-9._-]+', '-').Trim('-')
+            if (-not $name) { $name = 'opentag3d' }
+            $label = if ($r.generic) { 'Generic' } else { 'Edited' }
+            $path = Join-Path $dir "$name-$($r.tagType)-$label-Ndef.bin"
             [IO.File]::WriteAllBytes($path, $image)
             return @{ ok = $true; message = "Wrote $($image.Length) bytes to $path" }
         }
@@ -259,7 +315,18 @@ function Get-OpenTag3DGuiHtml {
   .frow label { flex:0 0 45%; margin:0; font-size:.84rem; opacity:.85; }
   .frow input { flex:1; padding:.35rem .5rem; }
   .frow input[readonly] { opacity:.55; cursor:not-allowed; }
-  .frow .sw { width:1.1rem; height:1.1rem; border-radius:3px; border:1px solid var(--edge); flex:0 0 auto; }
+  /* Colour rows: hex text stays authoritative, the picker and the clear button drive it. */
+  .frow input[type=color] { flex:0 0 2.1rem; width:2.1rem; height:1.9rem; padding:1px;
+                            cursor:pointer; background:var(--field); }
+  .frow input[type=color]::-webkit-color-swatch-wrapper { padding:1px; }
+  .frow input[type=color]::-webkit-color-swatch { border:none; border-radius:3px; }
+  .frow .clr { flex:0 0 auto; padding:.15rem .45rem; font-size:.85rem; line-height:1.2;
+               opacity:.6; }
+  .frow .clr:hover { opacity:1; }
+  .frow .unset { opacity:.35; }
+  .prow { display:flex; gap:.5rem; align-items:flex-end; }
+  .prow > div { flex:1; }
+  .prow button { flex:0 0 auto; }
   #editOut { margin-top:1.2rem; padding:.8rem .9rem; border-radius:6px; border:1px solid var(--edge);
              background:var(--field); color:var(--field-fg); white-space:pre-wrap;
              font:13px ui-monospace,SFMono-Regular,Consolas,monospace; display:none; }
@@ -273,7 +340,7 @@ function Get-OpenTag3DGuiHtml {
 </style>
 
 <h1>OpenTag3D &mdash; Polar Filament</h1>
-<p class="sub">Look up a spool, save a tag image, or write a tag.</p>
+<p class="sub">Look up a spool or build a tag by hand, then save an image or write a tag.</p>
 
 <nav class="tabs">
   <button class="tab active" data-screen="main">Fetch &amp; write</button>
@@ -295,6 +362,14 @@ function Get-OpenTag3DGuiHtml {
         </select>
       </div>
       <div>
+        <label for="eMode">Mode</label>
+        <select id="eMode">
+          <option value="">Default for tag type</option>
+          <option value="Core">Core</option>
+          <option value="Extended">Extended</option>
+        </select>
+      </div>
+      <div>
         <label for="eReader">Reader (blank = first ACR122)</label>
         <input id="eReader" placeholder="ACR122" autocomplete="off">
       </div>
@@ -302,8 +377,30 @@ function Get-OpenTag3DGuiHtml {
     <div class="actions">
       <button class="primary" id="loadSerial">Load from serial</button>
       <button id="loadTag">Load from tag</button>
+      <button id="loadNew">New tag</button>
     </div>
     <p class="note" id="editNote"></p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Vendor profiles</legend>
+    <div class="prow">
+      <div>
+        <label for="eProfile">Saved profile</label>
+        <select id="eProfile"><option value="">No profiles saved</option></select>
+      </div>
+      <button id="profileLoad" type="button">Load</button>
+      <button id="profileDelete" type="button">Delete</button>
+    </div>
+    <div class="prow" style="margin-top:.6rem">
+      <div>
+        <label for="eProfileName">Save current values as</label>
+        <input id="eProfileName" placeholder="acme-pla-matte" autocomplete="off">
+      </div>
+      <button id="profileSave" type="button">Save profile</button>
+    </div>
+    <p class="note">A profile stores the field values only &mdash; load one, then adjust the
+      batch details before writing.</p>
   </fieldset>
 
   <form id="editForm" hidden autocomplete="off">
@@ -497,6 +594,50 @@ function Get-OpenTag3DGuiHtml {
     o.textContent = msg;
   }
 
+  // A colour field is '#RRGGBB', optionally with ' (alpha N)'. The text box stays the
+  // value of record - it is what gets collected and posted - and the picker writes into
+  // it. An empty box means the colour is unused, which the spec stores as transparent
+  // black, so the picker starts neutral and only fills the box once you choose something.
+  function colourRow(row, inp, readonly) {
+    const pick = document.createElement('input');
+    pick.type = 'color';
+    pick.tabIndex = readonly ? -1 : 0;
+    pick.disabled = !!readonly;
+    pick.title = 'Pick a colour';
+
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'clr';
+    clear.textContent = 'clear';
+    clear.title = 'Leave this colour unused';
+    clear.disabled = !!readonly;
+
+    const hexOf = v => {
+      const m = /#?([0-9A-Fa-f]{6})/.exec(v || '');
+      return m ? '#' + m[1].toUpperCase() : null;
+    };
+    const alphaOf = v => {
+      const m = /\(alpha\s*(\d+)\)/i.exec(v || '');
+      return m ? ' (alpha ' + m[1] + ')' : '';
+    };
+    const sync = () => {
+      const hex = hexOf(inp.value);
+      pick.value = hex || '#000000';
+      pick.classList.toggle('unset', !hex);
+    };
+
+    pick.addEventListener('input', () => {
+      inp.value = pick.value.toUpperCase() + alphaOf(inp.value);
+      pick.classList.remove('unset');
+    });
+    inp.addEventListener('input', sync);
+    clear.addEventListener('click', () => { inp.value = ''; sync(); });
+
+    sync();
+    row.appendChild(pick);
+    row.appendChild(clear);
+  }
+
   function renderEditor(data) {
     loaded = data;
     $('editLegend').textContent = data.title || 'Tag data';
@@ -523,14 +664,7 @@ function Get-OpenTag3DGuiHtml {
       if (f.readonly) { inp.readOnly = true; inp.tabIndex = -1; }
       row.appendChild(lab);
       row.appendChild(inp);
-      if (f.type === 'rgba') {
-        const sw = document.createElement('span');
-        sw.className = 'sw';
-        const paint = () => { sw.style.background = (inp.value.split(' ')[0] || 'transparent'); };
-        inp.addEventListener('input', paint);
-        paint();
-        row.appendChild(sw);
-      }
+      if (f.type === 'rgba') colourRow(row, inp, f.readonly);
       host.appendChild(row);
     }
     $('editForm').hidden = false;
@@ -540,7 +674,7 @@ function Get-OpenTag3DGuiHtml {
 
   function collect() {
     const values = {};
-    document.querySelectorAll('#editFields input').forEach(i => { values[i.dataset.fid] = i.value; });
+    document.querySelectorAll('#editFields input[data-fid]').forEach(i => { values[i.dataset.fid] = i.value; });
     return values;
   }
 
@@ -552,19 +686,53 @@ function Get-OpenTag3DGuiHtml {
   }
 
   async function load(source) {
-    const btns = [$('loadSerial'), $('loadTag')];
+    const btns = [$('loadSerial'), $('loadTag'), $('loadNew'), $('profileLoad')];
     btns.forEach(b => b.disabled = true);
     eshow(true, 'Loading...');
     try {
       const data = await post('/api/load', {
         source, serial: $('eSerial').value.trim(),
-        tagType: $('eTagType').value, readerName: $('eReader').value.trim()
+        tagType: $('eTagType').value, mode: $('eMode').value,
+        readerName: $('eReader').value.trim(),
+        profileName: $('eProfile').value
       });
       if (data.ok) renderEditor(data); else { $('editForm').hidden = true; eshow(false, data.message); }
     } catch (e) { eshow(false, 'Request failed: ' + e.message); }
     finally {
       btns.forEach(b => b.disabled = false);
       if (!CAN_WRITE) $('loadTag').disabled = true;
+    }
+  }
+
+  // ---- vendor profiles ----
+  function fillProfiles(names, select) {
+    const sel = $('eProfile');
+    const keep = select || sel.value;
+    sel.innerHTML = '';
+    if (!names || !names.length) {
+      sel.innerHTML = '<option value="">No profiles saved</option>';
+      return;
+    }
+    for (const n of names) {
+      const o = document.createElement('option');
+      o.value = n; o.textContent = n;
+      sel.appendChild(o);
+    }
+    if (keep && names.includes(keep)) sel.value = keep;
+  }
+
+  async function profile(op, extra) {
+    const btns = [$('profileLoad'), $('profileSave'), $('profileDelete')];
+    btns.forEach(b => b.disabled = true);
+    try {
+      const data = await post('/api/profile', Object.assign({ op }, extra || {}));
+      if (data.profiles) fillProfiles(data.profiles, data.name);
+      if (op !== 'list') eshow(data.ok, data.message);
+      return data;
+    } catch (e) {
+      if (op !== 'list') eshow(false, 'Request failed: ' + e.message);
+    } finally {
+      btns.forEach(b => b.disabled = false);
     }
   }
 
@@ -595,6 +763,7 @@ function Get-OpenTag3DGuiHtml {
         target, tagType: $('eTagType').value, payloadHex: loaded.payloadHex,
         values: collect(), outputDir: $('eOutputDir').value.trim(),
         readerName: $('eReader').value.trim(),
+        generic: !!loaded.generic,
         confirmTruncate: !!confirmTruncate
       });
       if (data.confirm === 'truncate') {
@@ -611,6 +780,27 @@ function Get-OpenTag3DGuiHtml {
 
   $('loadSerial').onclick = () => load('serial');
   $('loadTag').onclick    = () => load('tag');
+  $('loadNew').onclick    = () => load('new');
+
+  $('profileLoad').onclick = () => {
+    if (!$('eProfile').value) { eshow(false, 'No profile selected.'); return; }
+    load('profile');
+  };
+  $('profileSave').onclick = () => {
+    const name = $('eProfileName').value.trim();
+    if (!name)   { eshow(false, 'Name the profile first.'); return; }
+    if (!loaded) { eshow(false, 'Load or start a tag before saving a profile.'); return; }
+    profile('save', {
+      name, values: collect(),
+      tagType: $('eTagType').value, mode: $('eMode').value || loaded.mode
+    });
+  };
+  $('profileDelete').onclick = () => {
+    const name = $('eProfile').value;
+    if (!name) { eshow(false, 'No profile selected.'); return; }
+    profile('delete', { name });
+  };
+  profile('list');
   $('applySave').onclick  = () => apply('file', false);
   $('applyWrite').onclick = () => apply('tag', false);
   $('revert').onclick     = () => { if (loaded) renderEditor(loaded); };

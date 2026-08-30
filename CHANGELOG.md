@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.6.0
+- Tags can be built by hand for any vendor, with no spool lookup: **New tag** on the
+  View & edit screen opens a blank form covering every spec field, which then saves as an
+  image or writes straight to a tag like any other payload. The serial is editable here -
+  on a looked-up payload it stays locked, being the key the data came from - while the tag
+  version stays fixed either way
+- Field values can be saved as named **vendor profiles** and loaded back into a blank form,
+  one JSON file each under `%APPDATA%\OpenTag3D\Profiles` or
+  `$XDG_CONFIG_HOME/opentag3d/profiles`. Profile names are validated, and unknown keys are
+  dropped on load, so an edited file cannot reach the encoder
+- Colour fields now have a native colour picker beside the hex box, with a clear button to
+  return a colour to unused. The hex box stays the value of record and alpha is preserved
+- A blank form leaves unset numbers and times empty rather than showing 0 and 00:00:00
+- Fields that fall outside the payload are no longer shown in the editor: a Core payload has
+  nowhere to store them, and an editable box that silently discards what you type is worse
+  than no box
+- Saved image names now come from the edited values rather than the loaded ones, and fall
+  back to manufacturer, material and colour when there is no serial
+
 ## 1.5.1
 - Reader names differ between platforms - Windows reports `ACS ACR122U PICC Interface 0`,
   pcsc-lite reports `ACS ACR122U 00 00` - so `-ReaderName` no longer requires a literal

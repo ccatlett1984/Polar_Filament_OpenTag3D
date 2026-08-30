@@ -169,7 +169,7 @@ On Windows this usually means one of:
                     break
                 }
 
-                '^POST /api/(export|write|read|load|apply)$' {
+                '^POST /api/(export|write|read|load|apply|profile)$' {
                     $action = $Matches[1]
                     $body   = [IO.StreamReader]::new($req.InputStream, $req.ContentEncoding).ReadToEnd()
                     $result = Invoke-OpenTag3DGuiAction -Action $action -Body $body -CanWrite $canWrite

@@ -3,7 +3,8 @@
 A PowerShell module for working with [OpenTag3D](https://opentag3d.info) NFC tags on
 Polar Filament spools. It looks up spool data by serial, builds NTAG21x tag images,
 reads and decodes existing tags, and writes tags through a PC/SC reader such as the
-ACR122U. A local browser UI is included for anyone who would rather not use the console.
+ACR122U. Tags for any other vendor can be filled in by hand in the browser UI, which is
+also there for anyone who would rather not use the console.
 
 Not affiliated with Polar Filament or the OpenTag3D project.
 
@@ -14,6 +15,7 @@ Not affiliated with Polar Filament or the OpenTag3D project.
   including UID/lock/capability-container header and the configuration pages
 - **Read a tag** and decode all 36 spec fields, or decode a saved `.bin` on any platform
 - **Edit tag data** before writing, with per-field validation
+- **Build a tag by hand** for any vendor, with no lookup, and save it as a reusable profile
 - **Write to a tag** over PC/SC, verifying every page afterwards
 - **Browser UI** covering all of the above
 
@@ -97,7 +99,7 @@ Read-OpenTag3DTag | Select-Object material, color_name, print_temp, serial
 # Decode a saved image (works on Linux and macOS too)
 Read-OpenTag3DTag -Path .\tag.bin | Select-Object -ExpandProperty Fields | Format-Table
 
-# Browser UI
+# Browser UI - also the place to build a tag for a non-Polar vendor by hand
 Show-OpenTag3DGui
 ```
 
@@ -163,12 +165,88 @@ Starts a local browser UI on `http://localhost:8787/`.
 The UI has two screens:
 
 - **Fetch & write** — look up a serial, save an image, write a tag, read a tag
-- **View & edit** — load data from a serial or a tag, edit any field, then save or write
+- **View & edit** — load data, change it, then save an image or write a tag
+
+**View & edit** starts from any of four sources:
+
+| Button | Starts from |
+|---|---|
+| **Load from serial** | A Polar Filament spool lookup |
+| **Load from tag** | Whatever is on the reader |
+| **New tag** | A blank form — every spec field editable, no lookup involved |
+| **Load** (under Saved profile) | Field values you saved earlier |
+
+Whichever source you start from, the editor is the same: fields grouped Core and Extended,
+per-field validation on save, a colour picker on each colour field, and **Save image** /
+**Write to tag** at the bottom. The last two sources are covered in
+[Generic vendor tags](#generic-vendor-tags).
 
 The page sends a heartbeat every three seconds. Once the first one arrives, the server
 shuts down if the heartbeat stops for `-IdleTimeout` seconds, so closing the tab stops
 the server. A page reload is not treated as a close. The listener binds to localhost
 only and has no authentication — fine on a desktop, not on a shared machine.
+
+## Generic vendor tags
+
+The spool lookup only knows about Polar Filament. To tag anything else — another brand, a
+refill, a spool you wound yourself — open **View & edit** and press **New tag**: every spec
+field starts blank and editable, and **Save image** or **Write to tag** finishes the job
+exactly as it does for a looked-up spool.
+
+![View & edit, mid-way through a hand-built tag](docs/gui-new-tag.png)
+
+Two things differ from an edited Polar payload:
+
+- The **serial** is yours to set. On a lookup it is locked, because it is the key the data
+  came from; on a hand-built tag it is just the vendor's batch id.
+- The **tag version** stays fixed at the spec version the module targets. It describes the
+  format, not the filament.
+
+Anything left blank is stored as zero, which the spec reads as "not supplied", so there is
+no need to fill in fields you do not have. Colour fields have a picker beside the hex box;
+**clear** returns a colour to unused.
+
+**Mode** decides how much of the spec the payload covers: Core is `0x00-0x6F` (112 bytes),
+Extended adds `0x70-0xBA` (187 bytes). Left on *Default for tag type* it follows the chip —
+Core for NTAG213, Extended otherwise. Choosing NTAG213 for an Extended payload asks before
+dropping the extended fields, and lists what survives.
+
+### Profiles
+
+**Save profile** stores the current field values under a name, and the dropdown loads them
+back into a blank form later — useful when you tag the same filament repeatedly and only the
+batch details change. A profile holds field values only; tag type and mode are remembered as
+a starting point, not enforced.
+
+Profiles are one JSON file each, so they can be edited by hand, copied between machines or
+kept in version control:
+
+| | |
+|---|---|
+| Windows | `%APPDATA%\OpenTag3D\Profiles` |
+| Linux, macOS | `$XDG_CONFIG_HOME/opentag3d/profiles`, defaulting to `~/.config` |
+
+```json
+{
+  "name": "acme-pla-matte",
+  "tagType": "NTAG215",
+  "mode": "Extended",
+  "savedUtc": "2026-08-30T22:31:52Z",
+  "values": {
+    "material": "PLA",
+    "manufacturer": "Acme Filament",
+    "color_1": "#C2410C",
+    "print_temp": "215 C"
+  }
+}
+```
+
+Keys are OpenTag3D field ids and values take the same display form the parser produces
+(`1.75 mm`, `215 C`, `#14ADDB`, `2026-04-03`). Anything that is not a spec field is ignored
+on load, and empty values are dropped on save.
+
+There is no cmdlet for building a generic tag yet — the module's field map and payload
+builder are in place for one, but for now this is a UI feature.
 
 ## Tag layout
 
@@ -313,6 +391,16 @@ NFC modules as above.
 polkit is refusing the client. Add your user to the pcscd policy, or run
 `pcscd --disable-polkit` for a quick test.
 
+**`Profile name '...' is not usable`**
+Profile names become file names, so they are restricted to letters, digits, spaces, dots,
+dashes and underscores, up to 64 characters. Nothing that could point outside the profile
+directory is accepted.
+
+**The profile dropdown is empty, or a profile has gone missing**
+Profiles are per-user files, not part of the module, so they do not travel with a reinstall
+and are not shared between accounts. Check the directory for your platform under
+[Profiles](#profiles) — copying the `.json` files there is all a move takes.
+
 **The module does not autoload, or `Private/` and `Public/` appear directly in `Modules/`**
 `Copy-Item` was given a `$dest` that did not exist yet, so it copied the module's *contents*
 there instead of the folder itself. Delete what landed in `Modules/`, create the directory
@@ -334,6 +422,9 @@ copy of the module is still on `$env:PSModulePath` — delete it and reinstall.
   the tag type it detected, and reads it back to confirm.
 - Reading and writing touch user memory only. The UID and the lock/configuration pages on a
   physical tag are never modified.
+- A hand-built tag is a normal OpenTag3D tag: same NDEF record, same field layout, same
+  capability container. Nothing marks it as having come from this module rather than a
+  vendor, and nothing about it is Polar-specific.
 
 ## License
 
