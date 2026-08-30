@@ -259,4 +259,4 @@ copy of the module is still on `$env:PSModulePath` — delete it and reinstall.
 
 ## License
 
-Choose a license before publishing — add a `LICENSE` file and reference it here.
+AGPLv3
