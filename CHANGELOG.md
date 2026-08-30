@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.5.1
+- Reader names differ between platforms - Windows reports `ACS ACR122U PICC Interface 0`,
+  pcsc-lite reports `ACS ACR122U 00 00` - so `-ReaderName` no longer requires a literal
+  substring match. A name that does not match exactly falls back to a per-word score, and
+  the error now lists the readers seen and suggests a shorter fragment
+- Tag identification is more robust on Linux:
+  - `GET_VERSION` is tried through both PN532 wrappers, `InDataExchange` and
+    `InCommunicateThru`. The Linux CCID driver frequently rejects the first
+  - the NDEF capability container at page 3 is used as a second method - a plain read of a
+    page every NTAG has
+  - the page probe now runs smallest chip first and resets the card between attempts. A
+    read past the end of memory makes the tag NAK, which wedges the card on pcsc-lite and
+    made every later probe fail as well
+  - the failure message lists what was tried and the status word each attempt returned
+- Install instructions now cover the Linux and macOS module path
+  (`~/.local/share/powershell/Modules`); `Unblock-File` is Windows-only and is skipped
+  elsewhere
+
 ## 1.5.0
 - Tag reading and writing now work on Linux and macOS through pcsc-lite, not Windows only.
   Three native bindings are declared, since the ABIs differ: Unicode entry points and 32-bit

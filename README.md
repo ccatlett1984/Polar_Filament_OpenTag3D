@@ -35,20 +35,49 @@ git clone https://github.com/ccatlett1984/Polar_Filament_OpenTag3D.git
 cd Polar_Filament_OpenTag3D
 ```
 
-Copy the `OpenTag3d_Polar_Filament` folder into a directory on your `$env:PSModulePath`:
+Copy the `OpenTag3d_Polar_Filament` folder into a directory on your `$env:PSModulePath`.
+The user-scoped module directory differs by platform — Windows keeps it under Documents,
+Linux and macOS under `~/.local/share`:
+
+**Windows**
 
 ```powershell
-# PowerShell 7
-$dest = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PowerShell\Modules'
+# Pick the line for the PowerShell you run - 7 and 5.1 keep separate module directories
+$dest = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PowerShell\Modules'         # PowerShell 7
+$dest = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell\Modules'  # Windows PowerShell 5.1
 
-# Windows PowerShell 5.1
-$dest = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell\Modules'
-
+New-Item -ItemType Directory -Path $dest -Force | Out-Null
 Copy-Item .\OpenTag3d_Polar_Filament -Destination $dest -Recurse -Force
 Get-ChildItem -Recurse (Join-Path $dest 'OpenTag3d_Polar_Filament') | Unblock-File
 ```
 
-Open a new session — the module autoloads, no `Import-Module` needed.
+**Linux and macOS** (PowerShell 7)
+
+```powershell
+$dest = Join-Path $HOME '.local/share/powershell/Modules'
+
+New-Item -ItemType Directory -Path $dest -Force | Out-Null
+Copy-Item ./OpenTag3d_Polar_Filament -Destination $dest -Recurse -Force
+```
+
+`Documents` is a Windows-only convention; PowerShell does not look there on Linux or macOS.
+`Unblock-File` is Windows-only too — it clears the mark-of-the-web and does not exist
+elsewhere. Create `$dest` before copying: if it does not exist, `Copy-Item` treats it as the
+destination *name* and unpacks the module's contents straight into `Modules\`, which does
+not autoload.
+
+If you are unsure where your module directories are,
+`$env:PSModulePath -split [IO.Path]::PathSeparator` lists every directory the current
+session searches; the user-scoped one is the first entry.
+
+Open a new session — the module autoloads, no `Import-Module` needed. To confirm the layout
+is right:
+
+```powershell
+Get-Module -ListAvailable OpenTag3d_Polar_Filament
+```
+
+The manifest must sit at `<module dir>/OpenTag3d_Polar_Filament/OpenTag3d_Polar_Filament.psd1`.
 
 ## Quick start
 
@@ -88,7 +117,7 @@ Fetches a spool payload and builds a tag image, either to a file or straight to 
 | `-Format` | `Ndef` `Raw` | Default `Ndef` |
 | `-OutputDir` | path | Defaults to Downloads (Windows) or `~` |
 | `-WriteToTag` | switch | Write to a reader instead of a file |
-| `-ReaderName` | substring | With `-WriteToTag`; defaults to the first `ACR122` |
+| `-ReaderName` | name fragment | With `-WriteToTag`; defaults to the first reader matching `ACR122`. See [Reader names](#reader-names) |
 
 `-OutputDir` and `-WriteToTag` are mutually exclusive.
 
@@ -100,12 +129,12 @@ Writes an existing image to a tag.
 |---|---|---|
 | `-Path` | path to `.bin` | Accepts pipeline input from `Get-ChildItem` |
 | `-Bytes` | `byte[]` | In-memory image instead of a file |
-| `-ReaderName` | substring | Defaults to the first `ACR122` |
+| `-ReaderName` | name fragment | Defaults to the first reader matching `ACR122`. See [Reader names](#reader-names) |
 | `-SkipBlankPages` | switch | Skips all-zero pages; faster on blank tags |
 
-Always performed: the chip is identified with `GET_VERSION` and checked against the
-image before anything is committed; the capability container on page 3 is written and
-read back; user memory is read back and compared page by page.
+Always performed: the chip is identified (see [Chip identification](#chip-identification))
+and checked against the image before anything is committed; the capability container on
+page 3 is written and read back; user memory is read back and compared page by page.
 
 ### `Read-OpenTag3DTag`
 
@@ -114,7 +143,7 @@ Reads a tag, or decodes a saved image, and returns the decoded fields.
 | Parameter | Values | Notes |
 |---|---|---|
 | `-Path` | path to `.bin` | Decode a saved image; works on any platform |
-| `-ReaderName` | substring | Defaults to the first `ACR122` |
+| `-ReaderName` | name fragment | Defaults to the first reader matching `ACR122`. See [Reader names](#reader-names) |
 | `-Raw` | switch | Also return the payload bytes |
 
 Every spec field is a property (`material`, `color_name`, `print_temp`, `serial`, …),
@@ -187,6 +216,38 @@ interface-compatible:
 \* The macOS declarations follow the framework headers but have not been exercised against
 a reader. Linux has been tested against `libpcsclite.so.1`; Windows is the primary target.
 
+### Reader names
+
+Reader names come from the driver, not from the module, so the same ACR122U is
+`ACS ACR122U PICC Interface 0` on Windows and `ACS ACR122U 00 00` under pcsc-lite.
+`-ReaderName` is a fragment rather than the full name, so use something both platforms
+share — `ACR122` — or leave it blank and the first reader matching `ACR122` is used. A
+fragment that does not match exactly falls back to a per-word score, so a name copied from
+another platform still resolves, with a warning naming the reader actually chosen.
+
+`Get-PcscReader` is not exported; to list what the service can see, use `pcsc_scan` on
+Linux or macOS.
+
+### Chip identification
+
+Reading or writing a physical tag starts by working out which NTAG21x is on the reader.
+Three methods are tried in order:
+
+1. **`GET_VERSION` (0x60)** through the reader's PN532 pass-through. Byte 6 of the reply is
+   the storage size: `0x0F` NTAG213, `0x11` NTAG215, `0x13` NTAG216. Both pseudo-APDU
+   wrappers are attempted — `InDataExchange` (`D4 40 01`) and `InCommunicateThru`
+   (`D4 42`) — because which one a reader accepts depends on the driver, and the Linux CCID
+   driver commonly rejects the first.
+2. **The capability container at page 3**, whose third byte is `0x12` / `0x3E` / `0x6D`.
+   A plain read of a page every NTAG has, so it works on any reader, but only on a tag that
+   has already been NDEF-formatted.
+3. **Probing the last user page** of each candidate, smallest chip first, resetting the card
+   between attempts. Reading past the end of memory makes the tag NAK, and on pcsc-lite that
+   leaves the card in an error state until it is reset — so both the order and the reset
+   matter.
+
+`-Verbose` reports which method identified the chip.
+
 ### Linux setup
 
 ```bash
@@ -231,6 +292,18 @@ Exactly what it says — the chip was identified before writing. Rebuild with th
 **`No tag on the reader`**
 Place the tag and retry.
 
+**`Reader matching '...' not found. Available: ACS ACR122U 00 00`**
+Reader names are set by the driver, so the same ACR122U is `ACS ACR122U PICC Interface 0`
+on Windows and `ACS ACR122U 00 00` under pcsc-lite. `-ReaderName` is a fragment, not the
+full name: use something both platforms share, such as `ACR122`, or leave it blank — the
+first reader matching `ACR122` is used automatically.
+
+**`Could not identify the tag as NTAG213, NTAG215 or NTAG216`**
+Re-run with `-Verbose` to see what each identification method returned. If every method
+reports `SW=6A81` or similar, the reader is passing APDUs through but the tag is not
+responding: reseat it, and on Linux confirm the kernel NFC modules are blacklisted (above)
+so pcscd owns the reader outright.
+
 **`No readers available` / `The PC/SC service is not running`**
 On Windows, start the Smart Card service. On Linux, start `pcscd` and check the reader is
 visible with `pcsc_scan`. If the reader is plugged in but invisible, blacklist the kernel
@@ -239,6 +312,11 @@ NFC modules as above.
 **`Access denied by the PC/SC service` (Linux)**
 polkit is refusing the client. Add your user to the pcscd policy, or run
 `pcscd --disable-polkit` for a quick test.
+
+**The module does not autoload, or `Private/` and `Public/` appear directly in `Modules/`**
+`Copy-Item` was given a `$dest` that did not exist yet, so it copied the module's *contents*
+there instead of the folder itself. Delete what landed in `Modules/`, create the directory
+first, and copy again — see [Install](#install).
 
 **Odd `Â` characters in output**
 Fixed in 1.4.0. Windows PowerShell 5.1 reads BOM-less `.ps1` files using the ANSI codepage,

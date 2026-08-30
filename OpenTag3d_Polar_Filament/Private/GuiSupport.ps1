@@ -296,7 +296,7 @@ function Get-OpenTag3DGuiHtml {
       </div>
       <div>
         <label for="eReader">Reader (blank = first ACR122)</label>
-        <input id="eReader" placeholder="ACR122U PICC" autocomplete="off">
+        <input id="eReader" placeholder="ACR122" autocomplete="off">
       </div>
     </div>
     <div class="actions">
@@ -368,7 +368,7 @@ function Get-OpenTag3DGuiHtml {
   <label for="outputDir">Output folder (blank = __DEFAULTDIR__)</label>
   <input id="outputDir" placeholder="__DEFAULTDIR__" autocomplete="off">
   <label for="readerName">Reader name, for writing (blank = first ACR122)</label>
-  <input id="readerName" placeholder="ACR122U PICC" autocomplete="off">
+  <input id="readerName" placeholder="ACR122" autocomplete="off">
   <div class="actions">
     <button class="primary" id="save">Save image</button>
     <button id="write">Write tag</button>
