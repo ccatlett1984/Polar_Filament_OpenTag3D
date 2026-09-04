@@ -78,7 +78,10 @@ function Get-OpenTag3DProfile {
     try { $json = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json }
     catch { throw "Profile '$Name' is not readable JSON: $($_.Exception.Message)" }
 
-    $known  = @($script:OpenTag3DFields | ForEach-Object { $_.Id })
+    # Accept ids from any version: a 1.003 profile loaded into a 2.000 form should keep the
+    # fields the two share, and the encoder ignores anything the target layout lacks.
+    $known  = @($script:OpenTag3DSpecVersions | ForEach-Object {
+                    (Get-OpenTag3DFieldTable -SpecVersion $_) | ForEach-Object { $_.Id } } | Sort-Object -Unique)
     $values = @{}
     if ($json.values) {
         foreach ($p in $json.values.PSObject.Properties) {
@@ -87,11 +90,16 @@ function Get-OpenTag3DProfile {
     }
 
     [pscustomobject]@{
-        Name    = $Name
-        TagType = if ($json.tagType -in 'NTAG213','NTAG215','NTAG216') { "$($json.tagType)" } else { 'NTAG215' }
-        Mode    = if ($json.mode -in 'Core','Extended') { "$($json.mode)" } else { 'Extended' }
-        Values  = $values
-        Path    = $path
+        Name        = $Name
+        TagType     = if ($json.tagType -in 'NTAG213','NTAG215','NTAG216') { "$($json.tagType)" } else { 'NTAG215' }
+        Mode        = if ($json.mode -in 'Core','Extended') { "$($json.mode)" } else { 'Extended' }
+        # Profiles written before this field existed are 1.003 by construction - their values
+        # were entered under 1.003 semantics (tolerance in micrometres, and so on), so this
+        # must not follow the module default.
+        SpecVersion = if ("$($json.specVersion)" -in $script:OpenTag3DSpecVersions) { "$($json.specVersion)" }
+                      else { '1.003' }
+        Values      = $values
+        Path        = $path
     }
 }
 
@@ -105,8 +113,11 @@ function Save-OpenTag3DProfile {
         [Parameter(Mandatory)] [string]$Name,
         [Parameter(Mandatory)] [hashtable]$Values,
         [Parameter()] [ValidateSet('NTAG213','NTAG215','NTAG216')] [string]$TagType = 'NTAG215',
-        [Parameter()] [ValidateSet('Core','Extended')] [string]$Mode = 'Extended'
+        [Parameter()] [ValidateSet('Core','Extended')] [string]$Mode = 'Extended',
+        [Parameter()] [string]$SpecVersion
     )
+
+    $spec = Get-OpenTag3DSpec -SpecVersion $SpecVersion
 
     $null = Test-OpenTag3DProfileName -Name $Name
     $path = Join-Path (Get-OpenTag3DProfileDir) "$Name.json"
@@ -114,7 +125,7 @@ function Save-OpenTag3DProfile {
     # Store spec fields only, and only ones with something in them: a profile is a set of
     # defaults to start from, not a full payload.
     $keep = [ordered]@{}
-    foreach ($f in $script:OpenTag3DFields) {
+    foreach ($f in $spec.Fields) {
         if ($f.Id -in $script:OpenTag3DGenericReadOnly) { continue }
         if (-not $Values.ContainsKey($f.Id)) { continue }
         $v = "$($Values[$f.Id])".Trim()
@@ -122,11 +133,12 @@ function Save-OpenTag3DProfile {
     }
 
     $doc = [ordered]@{
-        name     = $Name
-        tagType  = $TagType
-        mode     = $Mode
-        savedUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        values   = $keep
+        name        = $Name
+        tagType     = $TagType
+        mode        = $Mode
+        specVersion = $spec.Version
+        savedUtc    = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        values      = $keep
     }
 
     if ($PSCmdlet.ShouldProcess($path, 'Save profile')) {

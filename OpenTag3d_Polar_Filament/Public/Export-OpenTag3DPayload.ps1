@@ -31,7 +31,18 @@
 
 .PARAMETER Mode
     Core (smaller payload) or Extended (full field set). Defaults to Core for NTAG213 and
-    Extended for NTAG215/NTAG216. Extended is not possible on NTAG213.
+    Extended for NTAG215/NTAG216. Extended is not possible on NTAG213. A 1.003 concept only:
+    OpenTag3D 2.000 is one flat block, so -Mode is ignored there.
+
+.PARAMETER SpecVersion
+    Which OpenTag3D layout to produce: 1.003 or 2.000. Omit to keep whatever the lookup
+    service returns, which is the lossless option and what earlier versions of this module
+    did. Naming a version converts the payload if the service returned the other one; the
+    conversion matches fields by id and warns about anything that cannot carry across
+    (2.000's sku, barcode, nozzle_diameter and chamber_temp have no home in 1.003).
+
+    2.000 cannot be written to an NTAG213 - 216 bytes of payload against 144 bytes of user
+    memory - so that combination is refused.
 
 .PARAMETER Format
     Ndef (default) wraps the payload in an NDEF TLV. Raw writes the unwrapped payload.
@@ -43,6 +54,10 @@
 .PARAMETER WriteToTag
     Write the image straight to a tag on a PC/SC reader instead of saving a .bin file.
     Cannot be combined with -OutputDir.
+
+.PARAMETER PassThru
+    Return the image bytes instead of saving or writing them. Nothing touches the disk or a
+    reader. Useful for piping into Write-OpenTag3DTag -Bytes, or decoding in place.
 
 .PARAMETER ReaderName
     With -WriteToTag: substring of the reader name. Defaults to the first 'ACR122' match.
@@ -96,11 +111,18 @@
         [ValidateSet('Ndef','Raw')]
         [string]$Format = 'Ndef',
 
+        [Parameter()]
+        [ValidateSet('1.003','2.000')]
+        [string]$SpecVersion,
+
         [Parameter(ParameterSetName = 'ToFile')]
         [string]$OutputDir,
 
         [Parameter(Mandatory, ParameterSetName = 'ToTag')]
         [switch]$WriteToTag,
+
+        [Parameter(Mandatory, ParameterSetName = 'PassThru')]
+        [switch]$PassThru,
 
         [Parameter(ParameterSetName = 'ToTag')]
         [string]$ReaderName
@@ -155,9 +177,38 @@
 
         if ($data.Length -eq 0) { throw "Empty $Mode payload returned for serial '$Serial'." }
 
+        # --- spec version: keep what the service sent, or convert to the one asked for ---
+        $payload = if ($Format -eq 'Ndef') { Get-OpenTag3DRecordPayload -Record $data } else { ,[byte[]]$data }
+        $served  = if ($payload) { Get-OpenTag3DPayloadVersion -Payload $payload } else { $null }
+        if ($served) { Write-Verbose "Lookup returned an OpenTag3D $served payload." }
+
+        if ($PSBoundParameters.ContainsKey('SpecVersion')) {
+            if (-not $payload) {
+                throw "Cannot convert to $SpecVersion - the payload the service returned could not be unwrapped."
+            }
+            if (-not $served) {
+                throw "Cannot convert to $SpecVersion - the payload the service returned does not declare a version this module knows."
+            }
+            if ($served -ne $SpecVersion) {
+                Write-Verbose "Converting the $served payload to $SpecVersion."
+                $payload = Convert-OpenTag3DPayload -Payload $payload -ToSpecVersion $SpecVersion -FromSpecVersion $served
+                $data    = if ($Format -eq 'Ndef') { New-OpenTag3DNdefRecord -Payload $payload } else { $payload }
+                Write-Host "Converted the $served payload from the lookup to OpenTag3D $SpecVersion."
+            }
+        }
+
+        $effective = if ($payload) { Get-OpenTag3DPayloadVersion -Payload $payload } else { $null }
+        if ($TagType -eq 'NTAG213' -and $effective -eq '2.000') {
+            throw "OpenTag3D 2.000 cannot be written to an NTAG213 - the payload alone is $($payload.Length) bytes against 144 bytes of user memory. Use -TagType NTAG215 or NTAG216, or -SpecVersion 1.003."
+        }
+
         $image = New-OpenTag3DImage -Data $data -TagType $TagType -Format $Format
 
         Write-Verbose "Payload $($data.Length) bytes -> $($image.Length)-byte $TagType image"
+
+        if ($PSCmdlet.ParameterSetName -eq 'PassThru') {
+            return ,[byte[]]$image
+        }
 
         if ($PSCmdlet.ParameterSetName -eq 'ToTag') {
             $writeArgs = @{ Bytes = $image }

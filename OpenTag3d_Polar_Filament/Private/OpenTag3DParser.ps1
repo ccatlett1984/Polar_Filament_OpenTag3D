@@ -1,8 +1,23 @@
-﻿# OpenTag3D data structure, per the spec at https://opentag3d.info/spec.json
-# All integers unsigned big-endian; strings UTF-8 unless the field says ASCII;
-# temperatures stored in Celsius divided by 5.
+﻿# OpenTag3D data structures, per the published specs.
+#
+#   1.003  https://opentag3d.info/spec.json - the released version, and the one the Polar
+#          lookup service serves. Core 0x00-0x6F, Extended 0x70-0xBA.
+#   2.000  https://opentag3d.info/spec.json - released; the site moved from 1.003 to 2.000
+#          on or before 2026-09-03. One flat block, most fields relocated, four new fields,
+#          and NTAG213 dropped (216 bytes cannot fit 144 bytes of user memory).
+#
+# The two layouts share only tag_version, material and material_mod addresses, so they are
+# separate tables rather than one table with edits. A payload always carries its own version
+# at 0x00, which is what selects the table when decoding.
+#
+# All integers unsigned big-endian; strings UTF-8 unless the field says ASCII.
 
-$script:OpenTag3DSpecVersion = 1003   # the version this parser was written against
+$script:OpenTag3DSpecVersions       = @('1.003','2.000')
+
+# What a new tag is built as when nothing says otherwise. 2.000 since 1.7.0: it is the
+# published spec and what the Polar lookup service serves. 1.003 stays fully supported -
+# reading picks the table from the payload, so old tags are unaffected.
+$script:OpenTag3DDefaultSpecVersion = '2.000'
 
 # Fields the editor shows but never lets you change. The serial identifies the spool and is
 # what the lookup keys on; the tag version describes the format, not the filament.
@@ -16,7 +31,8 @@ $script:Um   = "$([char]0x00B5)m"        # micrometres
 $script:Cm3  = "g/cm$([char]0x00B3)"     # grams per cubic centimetre
 $script:Mm3s = "mm$([char]0x00B3)/s"     # cubic millimetres per second
 
-$script:OpenTag3DFields = @(
+# --- 1.003 -------------------------------------------------------------------------------
+$script:OpenTag3DFieldsV1 = @(
     # --- Core: 0x00 - 0x6F ---
     @{ Id='tag_version';         Name='Tag Version';          Start=0x00; Length=2; Type='version' }
     @{ Id='material';            Name='Material';             Start=0x02; Length=5; Type='utf8' }
@@ -57,6 +73,161 @@ $script:OpenTag3DFields = @(
     @{ Id='max_vso';             Name='Max Volumetric Speed'; Start=0xB9; Length=1; Type='int'; Unit=$script:Mm3s; Ext=$true }
     @{ Id='target_vso';          Name='Target Volumetric Speed'; Start=0xBA; Length=1; Type='int'; Unit=$script:Mm3s; Ext=$true }
 )
+
+# --- 2.000 (alpha) -----------------------------------------------------------------------
+#
+# Verified 2026-09-03 against both sources, which agree with each other:
+#   * https://opentag3d.info/spec.json - all 40 fields match on address, length, type,
+#     scaling and required flag.
+#   * https://pfil.us/opentag3d.php?id=50017-FYG5 - the 40 addresses it reports for a real
+#     spool are identical, and every value it shows re-encodes to the same bytes from this
+#     table (barcode 749565056953 -> 00AE858F17B9, tolerance 0.02mm -> 02, mfi_load 2160g
+#     -> D8, and so on).
+#
+# The spec declares the block 0x00-0xDF, but nothing is defined past data_url's last byte at
+# 0xD7, so a payload is 216 bytes. Undocumented gaps: 0x82-0x83, 0x8B, 0xAB-0xB7, 0xD8-0xDF.
+#
+# One block, 0x00-0xDF. Group is the spec's own "usage" attribute, which replaces the
+# Core/Extended split as the way the editor groups fields.
+$script:OpenTag3DFieldsV2 = @(
+    @{ Id='tag_version';         Name='Tag Version';          Start=0x00; Length=2; Type='version'; Group='Operational'; Required=$true }
+    @{ Id='material';            Name='Material';             Start=0x02; Length=5; Type='utf8'; Group='Display'; Required=$true }
+    @{ Id='material_mod';        Name='Material Modifiers';   Start=0x07; Length=5; Type='utf8'; Group='Display' }
+    @{ Id='manufacturer';        Name='Manufacturer';         Start=0x0C; Length=16; Type='utf8'; Group='Display'; Required=$true }
+    @{ Id='color_name';          Name='Color Name';           Start=0x1C; Length=32; Type='utf8'; Group='Display' }
+    @{ Id='color_1';             Name='Color 1';              Start=0x3C; Length=4; Type='rgba'; Group='Display'; Required=$true }
+    @{ Id='color_2';             Name='Color 2';              Start=0x40; Length=4; Type='rgba'; Group='Display' }
+    @{ Id='color_3';             Name='Color 3';              Start=0x44; Length=4; Type='rgba'; Group='Display' }
+    @{ Id='color_4';             Name='Color 4';              Start=0x48; Length=4; Type='rgba'; Group='Display' }
+    @{ Id='serial';              Name='Serial / Batch ID';    Start=0x4C; Length=32; Type='utf8'; Group='Inventory' }
+    @{ Id='sku';                 Name='SKU';                  Start=0x6C; Length=16; Type='utf8'; Group='Inventory'; Added='2.000' }
+    @{ Id='barcode';             Name='Barcode';              Start=0x7C; Length=6; Type='int'; Group='Inventory'; Added='2.000' }
+    @{ Id='mfg_date';            Name='Manufacture Date';     Start=0x84; Length=4; Type='date'; Group='Inventory' }
+    @{ Id='mfg_time';            Name='Manufacture Time';     Start=0x88; Length=3; Type='time'; Group='Inventory' }
+    @{ Id='diameter';            Name='Filament Diameter';    Start=0x8C; Length=2; Type='int'; Scale=0.001; Unit='mm'; Group='Operational'; Required=$true }
+    @{ Id='tolerance';           Name='Measured Tolerance';   Start=0x8E; Length=1; Type='int'; Scale=0.01; Unit='mm'; Group='Operational' }
+    @{ Id='nozzle_diameter';     Name='Min Nozzle Diameter';  Start=0x8F; Length=1; Type='int'; Scale=0.1; Unit='mm'; Group='Operational'; Added='2.000' }
+    @{ Id='print_temp';          Name='Print Temperature';    Start=0x90; Length=1; Type='int'; Scale=5; Unit=$script:Deg; Group='Operational'; Required=$true }
+    @{ Id='min_print_temp';      Name='Min Print Temp';       Start=0x91; Length=1; Type='int'; Scale=5; Unit=$script:Deg; Group='Operational' }
+    @{ Id='max_print_temp';      Name='Max Print Temp';       Start=0x92; Length=1; Type='int'; Scale=5; Unit=$script:Deg; Group='Operational' }
+    @{ Id='chamber_temp';        Name='Chamber Temperature';  Start=0x93; Length=1; Type='int'; Scale=5; Unit=$script:Deg; Group='Operational'; Required=$true; Added='2.000' }
+    @{ Id='bed_temp';            Name='Bed Temperature';      Start=0x94; Length=1; Type='int'; Scale=5; Unit=$script:Deg; Group='Operational'; Required=$true }
+    @{ Id='min_bed_temp';        Name='Min Bed Temp';         Start=0x95; Length=1; Type='int'; Scale=5; Unit=$script:Deg; Group='Operational' }
+    @{ Id='max_bed_temp';        Name='Max Bed Temp';         Start=0x96; Length=1; Type='int'; Scale=5; Unit=$script:Deg; Group='Operational' }
+    @{ Id='target_vso';          Name='Target Volumetric Speed'; Start=0x97; Length=1; Type='int'; Unit=$script:Mm3s; Group='Operational' }
+    @{ Id='min_vso';             Name='Min Volumetric Speed'; Start=0x98; Length=1; Type='int'; Unit=$script:Mm3s; Group='Operational' }
+    @{ Id='max_vso';             Name='Max Volumetric Speed'; Start=0x99; Length=1; Type='int'; Unit=$script:Mm3s; Group='Operational' }
+    @{ Id='max_dry_temp';        Name='Max Dry Temp';         Start=0x9A; Length=1; Type='int'; Scale=5; Unit=$script:Deg; Group='Operational' }
+    @{ Id='dry_time';            Name='Dry Time';             Start=0x9B; Length=1; Type='int'; Unit='hr'; Group='Operational' }
+    @{ Id='density';             Name='Density';              Start=0x9C; Length=2; Type='int'; Scale=0.001; Unit=$script:Cm3; Group='Operational'; Required=$true }
+    @{ Id='weight';              Name='Target Weight';        Start=0x9E; Length=2; Type='int'; Unit='g'; Group='Operational'; Required=$true }
+    @{ Id='empty_spool_weight';  Name='Empty Spool Weight';   Start=0xA0; Length=2; Type='int'; Unit='g'; Group='Operational' }
+    @{ Id='measured_length';     Name='Measured Length';      Start=0xA2; Length=2; Type='int'; Unit='m'; Group='Operational' }
+    @{ Id='measured_weight';     Name='Measured Weight';      Start=0xA4; Length=2; Type='int'; Unit='g'; Group='Operational' }
+    @{ Id='spool_core_diameter'; Name='Spool Core Diameter';  Start=0xA6; Length=1; Type='int'; Unit='mm'; Group='Operational' }
+    @{ Id='td';                  Name='Transmission Distance'; Start=0xA7; Length=1; Type='int'; Scale=0.1; Unit='mm'; Group='Operational' }
+    @{ Id='mfi_temp';            Name='MFI Temp';             Start=0xA8; Length=1; Type='int'; Scale=5; Unit=$script:Deg; Group='Operational' }
+    @{ Id='mfi_load';            Name='MFI Load';             Start=0xA9; Length=1; Type='int'; Scale=10; Unit='g'; Group='Operational' }
+    @{ Id='mfi_value';           Name='MFI Value';            Start=0xAA; Length=1; Type='int'; Scale=10; Unit='g/10min'; Group='Operational' }
+    @{ Id='data_url';            Name='Online Data URL';      Start=0xB8; Length=32; Type='ascii'; Group='Operational' }
+)
+
+$script:OpenTag3DSpecs = [ordered]@{
+    '1.003' = @{
+        Version    = '1.003'
+        Raw        = 1003
+        Major      = 1
+        Alpha      = $false
+        Fields     = $script:OpenTag3DFieldsV1
+        HasModes   = $true          # Core / Extended
+        CoreSize   = 0x70           # 112
+        FullSize   = 0xBB           # 187
+        GroupOrder = @('Core','Extended')
+        Source     = 'https://opentag3d.info/spec.json'
+    }
+    '2.000' = @{
+        Version    = '2.000'
+        Raw        = 2000
+        Major      = 2
+        Alpha      = $false
+        Fields     = $script:OpenTag3DFieldsV2
+        HasModes   = $false         # one flat block, no Core/Extended split
+        # The spec declares the block as 0x00-0xDF (224), but nothing is defined past
+        # data_url's last byte at 0xD7. 216 is therefore the payload every field fits in,
+        # and it is also what pfil.us emits.
+        CoreSize   = 0xD8           # 216
+        FullSize   = 0xD8           # 216
+        GroupOrder = @('Display','Inventory','Operational')
+        Source     = 'https://opentag3d.info/spec.json'
+    }
+}
+
+function Get-OpenTag3DSpec {
+    <#
+    .SYNOPSIS
+        The layout description for one spec version.
+    .PARAMETER SpecVersion
+        '1.003' or '2.000'. Defaults to 2.000.
+    #>
+    [CmdletBinding()]
+    param([Parameter()] [string]$SpecVersion)
+
+    if (-not $SpecVersion) { $SpecVersion = $script:OpenTag3DDefaultSpecVersion }
+    if (-not $script:OpenTag3DSpecs.Contains($SpecVersion)) {
+        throw "Unknown OpenTag3D spec version '$SpecVersion'. Known: $($script:OpenTag3DSpecVersions -join ', ')."
+    }
+    return $script:OpenTag3DSpecs[$SpecVersion]
+}
+
+function Get-OpenTag3DFieldTable {
+    <#
+    .SYNOPSIS
+        The field table for one spec version, in address order.
+    #>
+    [CmdletBinding()]
+    param([Parameter()] [string]$SpecVersion)
+
+    (Get-OpenTag3DSpec -SpecVersion $SpecVersion).Fields
+}
+
+function Get-OpenTag3DFieldSection {
+    <#
+    .SYNOPSIS
+        The group heading a field belongs under, for the version it came from.
+    .DESCRIPTION
+        1.003 splits Core from Extended, which is an address range and matters when
+        truncating for an NTAG213. 2.000 has no such split, so it groups by the spec's own
+        'usage' attribute instead.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] $Field)
+
+    if ($Field.Group) { return $Field.Group }
+    if ($Field.Ext)   { return 'Extended' }
+    return 'Core'
+}
+
+function Get-OpenTag3DPayloadVersion {
+    <#
+    .SYNOPSIS
+        The spec version a payload declares at 0x00, as a version string.
+    .DESCRIPTION
+        tag_version sits at 0x00 in every version of the spec, which is what makes a payload
+        self-describing. Returns $null if the payload is too short or the version is not one
+        this module has a table for.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [byte[]]$Payload)
+
+    if ($Payload.Length -lt 2) { return $null }
+    $raw   = ([int]$Payload[0] -shl 8) -bor $Payload[1]
+    $major = [math]::Floor($raw / 1000)
+
+    foreach ($v in $script:OpenTag3DSpecVersions) {
+        if ($script:OpenTag3DSpecs[$v].Major -eq $major) { return $v }
+    }
+    return $null
+}
 
 function Get-OpenTag3DNdefPayload {
     <#
@@ -118,9 +289,35 @@ function ConvertFrom-OpenTag3DPayload {
     <#
     .SYNOPSIS
         Decodes an OpenTag3D payload into an object.
+    .DESCRIPTION
+        A payload carries its own version at 0x00, so the field table is chosen from the data
+        rather than from the caller. -SpecVersion overrides that for a payload whose version
+        bytes are missing or wrong.
+    .PARAMETER SpecVersion
+        Force a layout instead of trusting the payload's own version bytes.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)] [byte[]]$Payload)
+    param(
+        [Parameter(Mandatory)] [byte[]]$Payload,
+        [Parameter()] [string]$SpecVersion
+    )
+
+    $declared = if ($Payload.Length -ge 2) { ([int]$Payload[0] -shl 8) -bor $Payload[1] } else { 0 }
+
+    if (-not $SpecVersion) {
+        $SpecVersion = Get-OpenTag3DPayloadVersion -Payload $Payload
+        if (-not $SpecVersion) {
+            throw ("Payload declares OpenTag3D version {0}.{1:D3}; this module has field tables for {2} only." -f
+                    [math]::Floor($declared / 1000), ($declared % 1000), ($script:OpenTag3DSpecVersions -join ' and '))
+        }
+    }
+    $spec = Get-OpenTag3DSpec -SpecVersion $SpecVersion
+
+    # Spec reader guidance: a newer minor version of a layout we know is parsed anyway.
+    if ($declared -gt $spec.Raw -and [math]::Floor($declared / 1000) -eq $spec.Major) {
+        Write-Warning ("Payload is OpenTag3D {0}.{1:D3}, newer than the {2} this module targets. Parsing anyway." -f
+                        [math]::Floor($declared / 1000), ($declared % 1000), $spec.Version)
+    }
 
     $get = {
         param($start, $len)
@@ -131,7 +328,7 @@ function ConvertFrom-OpenTag3DPayload {
     $rows = [System.Collections.Generic.List[object]]::new()
     $obj  = [ordered]@{}
 
-    foreach ($f in $script:OpenTag3DFields) {
+    foreach ($f in $spec.Fields) {
         $bytes = & $get $f.Start $f.Length
         if ($null -eq $bytes) { continue }
 
@@ -175,8 +372,9 @@ function ConvertFrom-OpenTag3DPayload {
                 }
             }
             'int' {
-                $raw = 0
-                foreach ($b in $bytes) { $raw = ([int]$raw -shl 8) -bor $b }
+                # 64-bit: 2.000's barcode is 6 bytes, which overflows Int32.
+                $raw = [long]0
+                foreach ($b in $bytes) { $raw = ($raw -shl 8) -bor $b }
                 $value = if ($f.Scale) { [math]::Round($raw * $f.Scale, 3) } else { $raw }
                 $display = if ($f.Unit) { "$value $($f.Unit)" } else { "$value" }
             }
@@ -188,27 +386,15 @@ function ConvertFrom-OpenTag3DPayload {
                 Name    = $f.Name
                 Id      = $f.Id
                 Value   = $display
-                Section = if ($f.Ext) { 'Extended' } else { 'Core' }
+                Section = Get-OpenTag3DFieldSection -Field $f
             })
         }
     }
 
-    # Spec reader guidance: warn on a newer minor version, refuse a newer major one.
-    if ($obj.tag_version) {
-        $major = [int]($obj.tag_version -split '\.')[0]
-        $mine  = [math]::Floor($script:OpenTag3DSpecVersion / 1000)
-        if ($major -gt $mine) {
-            throw "Tag uses OpenTag3D $($obj.tag_version); this parser understands major version $mine only."
-        }
-        $minor = [int]($obj.tag_version -split '\.')[1]
-        if ($minor -gt ($script:OpenTag3DSpecVersion % 1000)) {
-            Write-Warning "Tag uses OpenTag3D $($obj.tag_version), newer than the $([math]::Floor($script:OpenTag3DSpecVersion/1000)).$('{0:D3}' -f ($script:OpenTag3DSpecVersion % 1000)) this parser targets. Parsing anyway."
-        }
-    }
-
     $result = [pscustomobject]$obj
-    $result | Add-Member -NotePropertyName Fields     -NotePropertyValue $rows.ToArray()
+    $result | Add-Member -NotePropertyName Fields      -NotePropertyValue $rows.ToArray()
     $result | Add-Member -NotePropertyName PayloadSize -NotePropertyValue $Payload.Length
+    $result | Add-Member -NotePropertyName SpecVersion -NotePropertyValue $spec.Version
     return $result
 }
 
@@ -222,20 +408,31 @@ function ConvertTo-OpenTag3DPayload {
 
         Values are given as a hashtable keyed by field id, in the same display form the parser
         produces: '1.75 mm', '215 C', '#14ADDB', '2026-04-03', '10:19:33'.
+
+        The layout comes from the base payload's own version bytes unless -SpecVersion says
+        otherwise - encoding 2.000 values into a 1.003 base would write them at the wrong
+        addresses, so the two must agree.
     .PARAMETER TruncateTo
-        Optional payload length. Use 112 (0x70) to cut an Extended payload down to Core.
+        Optional payload length. Use 112 (0x70) to cut a 1.003 Extended payload down to Core.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] [byte[]]$BasePayload,
         [Parameter(Mandatory)] [hashtable]$Values,
+        [Parameter()] [string]$SpecVersion,
         [int]$TruncateTo
     )
+
+    if (-not $SpecVersion) {
+        $SpecVersion = Get-OpenTag3DPayloadVersion -Payload $BasePayload
+        if (-not $SpecVersion) { $SpecVersion = $script:OpenTag3DDefaultSpecVersion }
+    }
+    $spec = Get-OpenTag3DSpec -SpecVersion $SpecVersion
 
     $out = [byte[]]::new($BasePayload.Length)
     [Array]::Copy($BasePayload, $out, $BasePayload.Length)
 
-    foreach ($f in $script:OpenTag3DFields) {
+    foreach ($f in $spec.Fields) {
         if (-not $Values.ContainsKey($f.Id)) { continue }
         if ($f.Start + $f.Length -gt $out.Length) { continue }
 
@@ -292,17 +489,18 @@ function ConvertTo-OpenTag3DPayload {
             }
             'int' {
                 # Take the leading number only: units may contain digits (e.g. 'g/10min').
+                # 64-bit throughout - 2.000's 6-byte barcode does not fit an Int32.
                 $m = [regex]::Match($v, '^\s*(-?\d+(?:\.\d+)?)')
                 $n = if ($m.Success) { [double]$m.Groups[1].Value } else { 0 }
                 if ($f.Scale) { $n = $n / $f.Scale }
-                $n = [int][math]::Round($n)
-                $max = [math]::Pow(256, $f.Length) - 1
+                $n = [long][math]::Round($n)
+                $max = [long]([math]::Pow(256, $f.Length) - 1)
                 if ($n -lt 0 -or $n -gt $max) {
                     throw "Field '$($f.Name)': $v is out of range for $($f.Length) byte(s)."
                 }
                 for ($i = $f.Length - 1; $i -ge 0; $i--) {
                     $bytes[$i] = [byte]($n -band 0xFF)
-                    $n = [int]($n -shr 8)
+                    $n = $n -shr 8
                 }
             }
         }
@@ -311,4 +509,120 @@ function ConvertTo-OpenTag3DPayload {
 
     if ($TruncateTo -and $TruncateTo -lt $out.Length) { $out = $out[0..($TruncateTo - 1)] }
     return ,[byte[]]$out
+}
+
+function Get-OpenTag3DMissingRequiredField {
+    <#
+    .SYNOPSIS
+        Names of required fields a value table leaves empty.
+    .DESCRIPTION
+        1.003 has no notion of required fields; 2.000 marks ten. Callers warn rather than
+        refuse - an incomplete tag is still a tag, and the spec is alpha.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [hashtable]$Values,
+        [Parameter()] [string]$SpecVersion
+    )
+
+    foreach ($f in (Get-OpenTag3DFieldTable -SpecVersion $SpecVersion)) {
+        if (-not $f.Required) { continue }
+        if ($f.Id -eq 'tag_version') { continue }        # the module always stamps this
+        $v = if ($Values.ContainsKey($f.Id)) { "$($Values[$f.Id])".Trim() } else { '' }
+        if (-not $v) { $f.Name }
+    }
+}
+
+# Unit changes between versions. Only 'tolerance' moved: micrometres in 1.003, hundredths of
+# a millimetre in 2.000. Anything else that differs is refused rather than guessed at.
+$script:OpenTag3DUnitFactor = @{
+    "$($script:Um)|mm" = 0.001
+    "mm|$($script:Um)" = 1000
+}
+
+function Convert-OpenTag3DPayload {
+    <#
+    .SYNOPSIS
+        Re-encodes a payload from one spec version into another.
+    .DESCRIPTION
+        Matches fields by id, not address - the two layouts share almost no addresses. Values
+        carry across in their real-world units, so a field whose unit changed between versions
+        is converted rather than copied.
+
+        Fields the target version does not have, and values that no longer fit the target's
+        field width, are dropped with a warning. Nothing is guessed: a unit change this
+        function does not know about is reported and the field left empty.
+    .PARAMETER ToSpecVersion
+        The version to produce.
+    .PARAMETER FromSpecVersion
+        Override the version detected from the payload's own bytes.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [byte[]]$Payload,
+        [Parameter(Mandatory)] [string]$ToSpecVersion,
+        [Parameter()] [string]$FromSpecVersion
+    )
+
+    if (-not $FromSpecVersion) {
+        $FromSpecVersion = Get-OpenTag3DPayloadVersion -Payload $Payload
+        if (-not $FromSpecVersion) { throw "Cannot tell which OpenTag3D version this payload uses." }
+    }
+
+    $from = Get-OpenTag3DSpec -SpecVersion $FromSpecVersion
+    $to   = Get-OpenTag3DSpec -SpecVersion $ToSpecVersion
+
+    if ($from.Version -eq $to.Version) { return ,[byte[]]$Payload }
+
+    $decoded = ConvertFrom-OpenTag3DPayload -Payload $Payload -SpecVersion $from.Version
+    $toById  = @{}
+    foreach ($f in $to.Fields) { $toById[$f.Id] = $f }
+
+    $values  = @{}
+    $dropped = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($src in $from.Fields) {
+        if ($src.Id -eq 'tag_version') { continue }       # stamped by the blank payload
+
+        $value = $decoded.($src.Id)
+        if ($null -eq $value -or "$value" -eq '') { continue }
+
+        $dst = $toById[$src.Id]
+        if (-not $dst) { $dropped.Add("$($src.Name) (not in $($to.Version))"); continue }
+
+        if ($src.Type -ne 'int') { $values[$src.Id] = "$value"; continue }
+
+        # Numeric: carry the real-world value across, converting the unit if it changed.
+        $n = [double]$value
+        $su = if ($src.Unit) { "$($src.Unit)" } else { '' }
+        $du = if ($dst.Unit) { "$($dst.Unit)" } else { '' }
+        if ($su -ne $du) {
+            $factor = $script:OpenTag3DUnitFactor["$su|$du"]
+            if (-not $factor) {
+                $dropped.Add("$($src.Name) (unit $su -> $du not convertible)")
+                continue
+            }
+            $n = $n * $factor
+        }
+
+        # Does it still fit? 1.003's td is two bytes, 2.000's is one.
+        $rawTarget = if ($dst.Scale) { [math]::Round($n / $dst.Scale) } else { [math]::Round($n) }
+        $max       = [math]::Pow(256, $dst.Length) - 1
+        if ($rawTarget -lt 0 -or $rawTarget -gt $max) {
+            $dropped.Add("$($src.Name) ($value $su exceeds the $($dst.Length)-byte field in $($to.Version))")
+            continue
+        }
+
+        $values[$src.Id] = "$n"
+    }
+
+    if ($dropped.Count) {
+        Write-Warning ("Converting $($from.Version) -> $($to.Version) dropped: " + ($dropped -join '; '))
+    }
+
+    $base = [byte[]]::new($to.FullSize)
+    $base[0] = [byte](([int]$to.Raw -shr 8) -band 0xFF)
+    $base[1] = [byte]($to.Raw -band 0xFF)
+
+    return ,[byte[]](ConvertTo-OpenTag3DPayload -BasePayload $base -Values $values -SpecVersion $to.Version)
 }

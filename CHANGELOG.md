@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.7.0
+- **OpenTag3D 2.000 support, alongside 1.003.** The two layouts share only three addresses,
+  so they are separate field tables behind a spec registry rather than one table with edits.
+  2.000 is one flat 216-byte block against 1.003's Core-plus-Extended, adds `sku`, `barcode`,
+  `nozzle_diameter` and `chamber_temp`, moves `tolerance` from micrometres to hundredths of a
+  millimetre, and narrows `td` from two bytes to one. Verified field by field against
+  opentag3d.info/spec.json and against a live pfil.us lookup
+- **Reading needs no version.** A payload declares its own at `0x00`, so the field table is
+  chosen from the bytes. This matters now rather than later: the Polar lookup service already
+  serves 2.000, which 1.6.0 refused
+- **A spec version selector** on both GUI screens, and `-SpecVersion` on
+  `Export-OpenTag3DPayload`. **New tags default to 2.000** - the published spec, and what the
+  lookup service serves; 1.003 stays a first-class choice. The lookup path keeps whatever the
+  service returns unless a version is named, which is the lossless choice
+- Saved images from the editor name the spec version they hold, both versions being in
+  routine use. A profile with no recorded version is read as 1.003, since that is what its
+  values were entered under
+- **Conversion between versions**, matching fields by id and carrying values in real-world
+  units, so `tolerance` converts rather than copies. Fields the target lacks, and values too
+  wide for a narrower field, are dropped with a warning rather than mangled
+- **NTAG213 is refused for 2.000** - 216 bytes plus framing against 144 bytes of user memory.
+  The GUI removes the chip from the list while 2.000 is selected; the cmdlets explain why
+- The editor groups 2.000's fields by the spec's own `usage` attribute (Display, Inventory,
+  Operational), since 2.000 has no Core/Extended split
+- Missing required fields are reported on save and write. 2.000 marks ten; 1.003 marks none
+- Integer handling widened to 64-bit throughout - 2.000's `barcode` is 6 bytes and overflowed
+  `Int32` in both directions
+- Added `-PassThru` to `Export-OpenTag3DPayload`, returning the image bytes instead of writing
+  a file. The GUI now uses it rather than saving to a temp file and rebuilding the name
+- Profiles record the spec version they were saved from, and load into either
+
 ## 1.6.0
 - Tags can be built by hand for any vendor, with no spool lookup: **New tag** on the
   View & edit screen opens a blank form covering every spec field, which then saves as an

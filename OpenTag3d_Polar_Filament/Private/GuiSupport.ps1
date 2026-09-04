@@ -45,10 +45,14 @@ function Invoke-OpenTag3DGuiAction {
                     elseif ($r.tagType -eq 'NTAG213') { 'Core' }
                     else { 'Extended' }
 
+            $wanted = if ("$($r.specVersion)" -in $script:OpenTag3DSpecVersions) { "$($r.specVersion)" }
+                      else { $script:OpenTag3DDefaultSpecVersion }
+
             # A hand-built tag has no lookup behind it, so its serial is the vendor's own
             # batch id and stays editable. A Polar payload keeps the serial locked: it is
             # the key the data came from.
-            $generic = $false
+            $generic   = $false
+            $converted = $null
 
             if ($r.source -eq 'tag') {
                 if (-not $CanWrite) { return @{ ok = $false; message = 'No PC/SC reader available.' } }
@@ -59,25 +63,34 @@ function Invoke-OpenTag3DGuiAction {
             }
             elseif ($r.source -eq 'new') {
                 $generic = $true
-                $payload = New-OpenTag3DBlankPayload -Mode $mode
+                $payload = New-OpenTag3DBlankPayload -Mode $mode -SpecVersion $wanted
             }
             elseif ($r.source -eq 'profile') {
                 $generic = $true
                 if ([string]::IsNullOrWhiteSpace($r.profileName)) { return @{ ok = $false; message = 'Choose a profile to load.' } }
                 $prof    = Get-OpenTag3DProfile -Name $r.profileName
                 if (-not ("$($r.mode)" -in 'Core','Extended')) { $mode = $prof.Mode }
-                $payload = New-OpenTag3DGenericPayload -Values $prof.Values -Mode $mode
+                # A profile is a set of values, not a layout: it loads into whichever version
+                # is selected, and the encoder ignores ids that version does not have.
+                $payload = New-OpenTag3DGenericPayload -Values $prof.Values -Mode $mode -SpecVersion $wanted
             }
             else {
                 if ([string]::IsNullOrWhiteSpace($r.serial)) { return @{ ok = $false; message = 'Enter a spool serial.' } }
-                $img  = Export-OpenTag3DPayload -TagType $r.tagType -Serial $r.serial -Mode $mode -Format Ndef -OutputDir ([IO.Path]::GetTempPath()) -InformationAction SilentlyContinue -WarningAction SilentlyContinue 6>&1 | Out-Null
-                # Re-read what was just written, then clean it up: the lookup only serves files.
-                $file = Join-Path ([IO.Path]::GetTempPath()) "$($r.serial.ToUpperInvariant())-$($r.tagType)-$mode-Ndef.bin"
-                $payload = Get-OpenTag3DNdefPayload -UserMemory ([IO.File]::ReadAllBytes($file))
-                Remove-Item $file -Force -ErrorAction SilentlyContinue
+                # -PassThru keeps this off the disk entirely.
+                $img = Export-OpenTag3DPayload -TagType $r.tagType -Serial $r.serial -Mode $mode -Format Ndef -PassThru -InformationAction SilentlyContinue -WarningAction SilentlyContinue
+                $payload = Get-OpenTag3DNdefPayload -UserMemory $img
+
+                # The service picks the version; convert only if the page asked for the other.
+                $served = Get-OpenTag3DPayloadVersion -Payload $payload
+                if ($served -and $served -ne $wanted) {
+                    $payload  = Convert-OpenTag3DPayload -Payload $payload -ToSpecVersion $wanted -FromSpecVersion $served -WarningVariable convWarn -WarningAction SilentlyContinue
+                    $converted = "Converted from OpenTag3D $served to $wanted." +
+                                 $(if ($convWarn) { ' ' + (($convWarn | ForEach-Object { "$_" }) -join ' ') } else { '' })
+                }
             }
 
             $editable = @(Get-OpenTag3DEditableField -Payload $payload -AllowSerial:$generic -BlankUnset:$generic)
+            $actual   = Get-OpenTag3DPayloadVersion -Payload $payload
 
             $byId = @{}
             foreach ($e in $editable) { $byId[$e.id] = $e.value }
@@ -90,12 +103,15 @@ function Invoke-OpenTag3DGuiAction {
             }
 
             return @{
-                ok         = $true
-                fields     = @($editable)
-                payloadHex = ([BitConverter]::ToString($payload) -replace '-')
-                generic    = $generic
-                mode       = $mode
-                title      = $title
+                ok          = $true
+                fields      = @($editable)
+                payloadHex  = ([BitConverter]::ToString($payload) -replace '-')
+                generic     = $generic
+                mode        = $mode
+                specVersion = $actual
+                hasModes    = (Get-OpenTag3DSpec -SpecVersion $actual).HasModes
+                note        = $converted
+                title       = $title
             }
         }
         catch { return @{ ok = $false; message = $_.Exception.Message } }
@@ -114,7 +130,8 @@ function Invoke-OpenTag3DGuiAction {
                     if ($values.Count -eq 0) { return @{ ok = $false; message = 'Nothing to save.' } }
                     $mode = if ("$($r.mode)" -in 'Core','Extended') { "$($r.mode)" } else { 'Extended' }
                     $type = if ("$($r.tagType)" -in 'NTAG213','NTAG215','NTAG216') { "$($r.tagType)" } else { 'NTAG215' }
-                    $path = Save-OpenTag3DProfile -Name "$($r.name)" -Values $values -TagType $type -Mode $mode
+                    $sv   = if ("$($r.specVersion)" -in $script:OpenTag3DSpecVersions) { "$($r.specVersion)" } else { $script:OpenTag3DDefaultSpecVersion }
+                    $path = Save-OpenTag3DProfile -Name "$($r.name)" -Values $values -TagType $type -Mode $mode -SpecVersion $sv
                     return @{ ok = $true; message = "Saved profile to $path"; profiles = @(Get-OpenTag3DProfileList); name = "$($r.name)" }
                 }
                 'delete' {
@@ -149,13 +166,22 @@ function Invoke-OpenTag3DGuiAction {
             # file name all come from this.
             $full = ConvertTo-OpenTag3DPayload -BasePayload $base -Values $values -WarningAction SilentlyContinue
 
-            # NTAG213 holds Core only; cut the payload at 0x70. Anything populated above that
-            # address is lost, so say what will go and require an explicit confirmation.
-            $truncate = if ($r.tagType -eq 'NTAG213' -and $full.Length -gt 112) { 112 } else { 0 }
+            # The base payload carries its own version, so the encoder above used the right
+            # table. Everything from here on has to agree with it.
+            $version = Get-OpenTag3DPayloadVersion -Payload $base
+            $spec    = Get-OpenTag3DSpec -SpecVersion $version
+
+            if ($r.tagType -eq 'NTAG213' -and $version -eq '2.000') {
+                return @{ ok = $false; message = "OpenTag3D 2.000 cannot be written to an NTAG213: the payload is $($full.Length) bytes against 144 bytes of user memory. Choose NTAG215 or NTAG216, or switch the spec version to 1.003." }
+            }
+
+            # NTAG213 holds 1.003 Core only; cut the payload at 0x70. Anything populated above
+            # that address is lost, so say what will go and require an explicit confirmation.
+            $truncate = if ($spec.HasModes -and $r.tagType -eq 'NTAG213' -and $full.Length -gt 112) { 112 } else { 0 }
             if ($truncate) {
                 $all      = @(ConvertFrom-OpenTag3DPayload -Payload $full | Select-Object -ExpandProperty Fields)
                 $dropping = @($all | Where-Object { $_.Section -eq 'Extended' })
-                $keeping  = @($all | Where-Object { $_.Section -eq 'Core' })
+                $keeping  = @($all | Where-Object { $_.Section -ne 'Extended' })
                 if ($dropping.Count -and -not $r.confirmTruncate) {
                     return @{
                         ok      = $false
@@ -171,12 +197,18 @@ function Invoke-OpenTag3DGuiAction {
             $record = New-OpenTag3DNdefRecord -Payload $payload
             $image  = New-OpenTag3DImage -Data $record -TagType $r.tagType -Format Ndef
 
+            # 2.000 marks ten fields required. An incomplete tag is still a tag, so this is
+            # said rather than enforced.
+            $missing = @(Get-OpenTag3DMissingRequiredField -Values $values -SpecVersion $version)
+            $warn    = if ($missing.Count) { " Required by $($version) but left empty: $($missing -join ', ')." } else { '' }
+
             if ($r.target -eq 'tag') {
                 if (-not $CanWrite) { return @{ ok = $false; message = 'No PC/SC reader available.' } }
                 $p = @{ Bytes = $image }
                 if ($r.readerName) { $p.ReaderName = $r.readerName }
                 $text = (Write-OpenTag3DTag @p 6>&1 3>&1 | Out-String).Trim()
-                return @{ ok = $true; message = if ($text) { $text } else { 'Written.' } }
+                $msg = if ($text) { $text } else { 'Written.' }
+                return @{ ok = $true; message = $msg + $warn }
             }
 
             $dir = if ($r.outputDir) { $r.outputDir } else { Get-OpenTag3DDefaultOutputDir }
@@ -190,10 +222,13 @@ function Invoke-OpenTag3DGuiAction {
             $name = (@($parts | Where-Object { $_ }) -join '-')
             $name = ($name -replace '[^A-Za-z0-9._-]+', '-').Trim('-')
             if (-not $name) { $name = 'opentag3d' }
+            # Name the version outright rather than only when it is not the default: with two
+            # formats in routine use, an unlabelled file is ambiguous a month later.
             $label = if ($r.generic) { 'Generic' } else { 'Edited' }
+            $label = "$label-$version"
             $path = Join-Path $dir "$name-$($r.tagType)-$label-Ndef.bin"
             [IO.File]::WriteAllBytes($path, $image)
-            return @{ ok = $true; message = "Wrote $($image.Length) bytes to $path" }
+            return @{ ok = $true; message = "Wrote $($image.Length) bytes to $path" + $warn }
         }
         catch { return @{ ok = $false; message = $_.Exception.Message } }
     }
@@ -283,8 +318,10 @@ function Get-OpenTag3DGuiHtml {
   option { background:var(--field); color:var(--field-fg); }
   input::placeholder { color:var(--fg); opacity:.45; }
   input:focus,select:focus { outline:2px solid var(--accent); outline-offset:1px; }
-  .row { display:flex; gap:.75rem; }
-  .row > div { flex:1; }
+  /* Wraps rather than squeezing: the edit screen's row carries four controls since the
+     spec version selector arrived, and four across truncates their labels. */
+  .row { display:flex; gap:.75rem; flex-wrap:wrap; }
+  .row > div { flex:1 1 9rem; min-width:0; }
   .actions { display:flex; gap:.6rem; margin-top:1.4rem; align-items:center; }
   button { padding:.55rem 1.1rem; font:inherit; border-radius:6px; border:1px solid var(--edge);
            background:var(--field); color:var(--field-fg); cursor:pointer; }
@@ -359,6 +396,13 @@ function Get-OpenTag3DGuiHtml {
           <option>NTAG213</option>
           <option selected>NTAG215</option>
           <option>NTAG216</option>
+        </select>
+      </div>
+      <div>
+        <label for="eSpec">Spec version</label>
+        <select id="eSpec">
+          <option value="2.000" selected>2.000</option>
+          <option value="1.003">1.003</option>
         </select>
       </div>
       <div>
@@ -458,6 +502,13 @@ function Get-OpenTag3DGuiHtml {
       </select>
     </div>
   </div>
+  <label for="spec">Spec version</label>
+  <select id="spec">
+    <option value="" selected>As served by the lookup</option>
+    <option value="1.003">1.003</option>
+    <option value="2.000">2.000</option>
+  </select>
+  <p class="note" id="specNote"></p>
 </fieldset>
 
 <fieldset>
@@ -497,7 +548,8 @@ function Get-OpenTag3DGuiHtml {
       mode:       $('mode').value,
       format:     $('format').value,
       outputDir:  $('outputDir').value.trim(),
-      readerName: $('readerName').value.trim()
+      readerName: $('readerName').value.trim(),
+      specVersion: $('spec').value
     };
   }
 
@@ -568,6 +620,44 @@ function Get-OpenTag3DGuiHtml {
   $('write').onclick = () => run('write');
   $('read').onclick  = () => run('read');
   $('serial').addEventListener('keydown', e => { if (e.key === 'Enter') run('export'); });
+
+  // ---- spec version ----
+  // 2.000 dropped NTAG213 (216 bytes of payload against 144 bytes of user memory), so the
+  // chip is taken out of the list rather than left there to fail on write. It comes back
+  // when 1.003 is selected. Mode is a 1.003 concept too - 2.000 is one flat block.
+  function applySpec(specSel, typeSel, modeSel, note) {
+    const v = specSel.value;
+    const v2 = v === '2.000';
+
+    const had = typeSel.value;
+    if (v2) {
+      const opt = [...typeSel.options].find(o => (o.value || o.textContent) === 'NTAG213');
+      if (opt) opt.remove();
+      if (had === 'NTAG213') typeSel.value = 'NTAG215';
+    } else if (![...typeSel.options].some(o => (o.value || o.textContent) === 'NTAG213')) {
+      const opt = document.createElement('option');
+      opt.textContent = 'NTAG213';
+      typeSel.insertBefore(opt, typeSel.firstChild);
+    }
+
+    if (modeSel) {
+      modeSel.disabled = v2;
+      modeSel.title = v2 ? 'OpenTag3D 2.000 is one flat block - Core and Extended are 1.003 only'
+                         : '';
+    }
+    if (note) {
+      note.textContent = v2
+        ? 'OpenTag3D 2.000: one 216-byte block, four extra fields (SKU, barcode, nozzle, chamber temp), NTAG215 or NTAG216 only.'
+        : (v === '1.003' ? 'OpenTag3D 1.003: Core 112 bytes, Extended 187. Fits any NTAG21x.'
+                         : 'Whatever the lookup service returns is written unchanged.');
+    }
+  }
+
+  const eSpecSync = () => applySpec($('eSpec'), $('eTagType'), $('eMode'), null);
+  const mSpecSync = () => applySpec($('spec'), $('tagType'), $('mode'), $('specNote'));
+  $('eSpec').onchange = eSpecSync;
+  $('spec').onchange  = mSpecSync;
+  eSpecSync(); mSpecSync();
 
   // ---- tabs ----
   document.querySelectorAll('.tab').forEach(t => {
@@ -640,7 +730,14 @@ function Get-OpenTag3DGuiHtml {
 
   function renderEditor(data) {
     loaded = data;
-    $('editLegend').textContent = data.title || 'Tag data';
+    // The payload decides the version, not the dropdown: loading a tag or a lookup can hand
+    // back the other one, and the form must follow the bytes it is editing.
+    if (data.specVersion && $('eSpec').value !== data.specVersion) {
+      $('eSpec').value = data.specVersion;
+      eSpecSync();
+    }
+    $('editLegend').textContent = (data.title || 'Tag data') +
+                                  (data.specVersion ? '  \u00b7  OpenTag3D ' + data.specVersion : '');
     const host = $('editFields');
     host.innerHTML = '';
     let section = null;
@@ -669,7 +766,7 @@ function Get-OpenTag3DGuiHtml {
     }
     $('editForm').hidden = false;
     $('confirm').style.display = 'none';
-    eshow(true, 'Loaded. Edit any field, then save or write.');
+    eshow(true, (data.note ? data.note + ' ' : '') + 'Loaded. Edit any field, then save or write.');
   }
 
   function collect() {
@@ -693,6 +790,7 @@ function Get-OpenTag3DGuiHtml {
       const data = await post('/api/load', {
         source, serial: $('eSerial').value.trim(),
         tagType: $('eTagType').value, mode: $('eMode').value,
+        specVersion: $('eSpec').value,
         readerName: $('eReader').value.trim(),
         profileName: $('eProfile').value
       });
@@ -792,7 +890,8 @@ function Get-OpenTag3DGuiHtml {
     if (!loaded) { eshow(false, 'Load or start a tag before saving a profile.'); return; }
     profile('save', {
       name, values: collect(),
-      tagType: $('eTagType').value, mode: $('eMode').value || loaded.mode
+      tagType: $('eTagType').value, mode: $('eMode').value || loaded.mode,
+      specVersion: loaded.specVersion || $('eSpec').value
     });
   };
   $('profileDelete').onclick = () => {

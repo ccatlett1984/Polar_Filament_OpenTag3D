@@ -11,9 +11,11 @@ Not affiliated with Polar Filament or the OpenTag3D project.
 ## What it does
 
 - **Look up a spool** by serial and fetch its OpenTag3D payload
+- **Read and write both spec versions** — 1.003 and 2.000 — and convert between them
 - **Build a complete tag image** — 180 bytes (NTAG213), 540 (NTAG215) or 924 (NTAG216),
   including UID/lock/capability-container header and the configuration pages
-- **Read a tag** and decode all 36 spec fields, or decode a saved `.bin` on any platform
+- **Read a tag** and decode every spec field — 36 in 1.003, 40 in 2.000 — or decode a saved
+  `.bin` on any platform
 - **Edit tag data** before writing, with per-field validation
 - **Build a tag by hand** for any vendor, with no lookup, and save it as a reusable profile
 - **Write to a tag** over PC/SC, verifying every page afterwards
@@ -90,6 +92,9 @@ Export-OpenTag3DPayload -TagType NTAG215 -Serial 50017-FYG5
 # Fetch and write to a tag in one step
 Export-OpenTag3DPayload -TagType NTAG215 -Serial 50017-FYG5 -WriteToTag
 
+# Force a spec version, converting if the lookup served the other one
+Export-OpenTag3DPayload -TagType NTAG215 -Serial 50017-FYG5 -SpecVersion 2.000
+
 # Write a saved image
 Write-OpenTag3DTag -Path .\50017-FYG5-NTAG215-Extended-Ndef.bin
 
@@ -117,8 +122,10 @@ Fetches a spool payload and builds a tag image, either to a file or straight to 
 | `-Serial` | e.g. `50017-FYG5` | Required; normalised to upper case; accepts pipeline input |
 | `-Mode` | `Core` `Extended` | Defaults to `Core` for NTAG213, `Extended` otherwise |
 | `-Format` | `Ndef` `Raw` | Default `Ndef` |
+| `-SpecVersion` | `1.003` `2.000` | Omit to keep what the lookup returns; naming one converts. See [Spec versions](#spec-versions) |
 | `-OutputDir` | path | Defaults to Downloads (Windows) or `~` |
 | `-WriteToTag` | switch | Write to a reader instead of a file |
+| `-PassThru` | switch | Return the image bytes instead of saving or writing |
 | `-ReaderName` | name fragment | With `-WriteToTag`; defaults to the first reader matching `ACR122`. See [Reader names](#reader-names) |
 
 `-OutputDir` and `-WriteToTag` are mutually exclusive.
@@ -149,7 +156,10 @@ Reads a tag, or decodes a saved image, and returns the decoded fields.
 | `-Raw` | switch | Also return the payload bytes |
 
 Every spec field is a property (`material`, `color_name`, `print_temp`, `serial`, …),
-plus a `Fields` collection for display.
+plus a `Fields` collection for display and a `SpecVersion` saying which layout was read.
+
+There is no version parameter: a payload declares its own at `0x00`, so the field table is
+chosen from the bytes. A tag written to either spec reads correctly without being told which.
 
 ### `Show-OpenTag3DGui`
 
@@ -186,6 +196,53 @@ shuts down if the heartbeat stops for `-IdleTimeout` seconds, so closing the tab
 the server. A page reload is not treated as a close. The listener binds to localhost
 only and has no authentication — fine on a desktop, not on a shared machine.
 
+## Spec versions
+
+OpenTag3D has two published layouts and the module speaks both.
+
+| | 1.003 | 2.000 |
+|---|---|---|
+| Structure | Core `0x00-0x6F`, Extended to `0xBA` | one block, `0x00-0xD7` |
+| Payload | 112 or 187 bytes | 216 bytes |
+| Fields | 36 | 40 — adds `sku`, `barcode`, `nozzle_diameter`, `chamber_temp` |
+| Chips | NTAG213, 215, 216 | **NTAG215 or 216 only** |
+| `-Mode` | Core / Extended | not applicable |
+| Required fields | none | ten, warned about but not enforced |
+
+**A payload declares its own version at `0x00`**, so reading never needs to be told which
+layout to expect — `Read-OpenTag3DTag` picks the table from the bytes, and the GUI's version
+selector follows whatever you load rather than overriding it.
+
+Writing is where the selector matters. In the GUI it sits beside the tag type on both
+screens; on the command line it is `-SpecVersion`. New tags default to **2.000** — the
+published spec, and what the lookup service serves. 1.003 stays a first-class choice for
+tagging alongside existing stock, and old tags are unaffected either way, since reading
+follows the payload.
+
+Because 2.000 is the default, NTAG213 is absent from the tag-type list until you select
+1.003: 216 bytes plus NDEF framing cannot fit 144 bytes of user memory. The cmdlets refuse
+the same combination with that explanation.
+
+### Converting between versions
+
+The lookup service decides its own version, so `Export-OpenTag3DPayload` passes its payload
+through untouched unless `-SpecVersion` asks for the other one. Conversion matches fields by
+id, not address — the two layouts share almost no addresses — and carries values across in
+real-world units, so `tolerance` converts properly between 1.003's micrometres and 2.000's
+hundredths of a millimetre.
+
+Anything that cannot carry across is dropped with a warning rather than mangled: 2.000's four
+new fields have no home in 1.003, and a value too wide for a narrower field (1.003's two-byte
+`td` into 2.000's one byte) is reported instead of truncated.
+
+```powershell
+# Whatever the service serves, unchanged
+Export-OpenTag3DPayload -TagType NTAG215 -Serial 50017-FYG5
+
+# Force a layout, converting if the service served the other one
+Export-OpenTag3DPayload -TagType NTAG215 -Serial 50017-FYG5 -SpecVersion 2.000
+```
+
 ## Generic vendor tags
 
 The spool lookup only knows about Polar Filament. To tag anything else — another brand, a
@@ -193,7 +250,7 @@ refill, a spool you wound yourself — open **View & edit** and press **New tag*
 field starts blank and editable, and **Save image** or **Write to tag** finishes the job
 exactly as it does for a looked-up spool.
 
-![View & edit, mid-way through a hand-built tag](docs/gui-new-tag.png)
+![View & edit, mid-way through a hand-built 2.000 tag](docs/gui-view-edit.png)
 
 Two things differ from an edited Polar payload:
 
@@ -206,17 +263,23 @@ Anything left blank is stored as zero, which the spec reads as "not supplied", s
 no need to fill in fields you do not have. Colour fields have a picker beside the hex box;
 **clear** returns a colour to unused.
 
-**Mode** decides how much of the spec the payload covers: Core is `0x00-0x6F` (112 bytes),
-Extended adds `0x70-0xBA` (187 bytes). Left on *Default for tag type* it follows the chip —
-Core for NTAG213, Extended otherwise. Choosing NTAG213 for an Extended payload asks before
-dropping the extended fields, and lists what survives.
+**Spec version** picks the layout — see [Spec versions](#spec-versions). It opens on 2.000.
+The form follows it: 2.000 shows 40 fields grouped Display / Inventory / Operational, 1.003
+shows 36 grouped Core / Extended. Saved images name the version they hold, so
+`ACME-0001-NTAG215-Generic-2.000-Ndef.bin` is unambiguous a month later.
+
+**Mode** is a 1.003 concept and greys out for 2.000. Core is `0x00-0x6F` (112 bytes), Extended
+adds `0x70-0xBA` (187 bytes). Left on *Default for tag type* it follows the chip — Core for
+NTAG213, Extended otherwise. Choosing NTAG213 for an Extended payload asks before dropping the
+extended fields, and lists what survives.
 
 ### Profiles
 
 **Save profile** stores the current field values under a name, and the dropdown loads them
 back into a blank form later — useful when you tag the same filament repeatedly and only the
-batch details change. A profile holds field values only; tag type and mode are remembered as
-a starting point, not enforced.
+batch details change. A profile holds field values only; tag type, mode and spec version are
+remembered as a starting point, not enforced — a profile saved from a 2.000 form loads into a
+1.003 one, keeping the fields the two versions share.
 
 Profiles are one JSON file each, so they can be edited by hand, copied between machines or
 kept in version control:
@@ -231,6 +294,7 @@ kept in version control:
   "name": "acme-pla-matte",
   "tagType": "NTAG215",
   "mode": "Extended",
+  "specVersion": "1.003",
   "savedUtc": "2026-08-30T22:31:52Z",
   "values": {
     "material": "PLA",
@@ -268,9 +332,21 @@ By default the payload is wrapped as an NDEF message — an `application/opentag
 record inside an NDEF TLV — so readers report the tag as NFC Forum Type 2 with a readable
 record. `-Format Raw` writes the bare payload at page 4 instead.
 
-NTAG213 holds only the OpenTag3D Core block (0x00–0x6F), so Extended data cannot fit.
-Asking for Extended on an NTAG213 falls back to Core with a warning, and the edit screen
-lists exactly which fields survive before writing.
+How much of that user memory a payload needs depends on the spec version:
+
+| Payload | Bytes | Fits |
+|---|---|---|
+| 1.003 Core (`0x00–0x6F`) | 112 | any NTAG21x |
+| 1.003 Extended (`0x00–0xBA`) | 187 | NTAG215, NTAG216 |
+| 2.000 (`0x00–0xD7`) | 216 | NTAG215, NTAG216 |
+
+Add roughly 27 bytes of NDEF framing to each — record header, the 21-byte
+`application/opentag3d` type, the TLV and its terminator.
+
+An NTAG213 holds only the 1.003 Core block, so asking for Extended on one falls back to Core
+with a warning, and the edit screen lists exactly which fields survive before writing.
+**2.000 cannot go on an NTAG213 at all** — 216 bytes plus framing against 144 bytes of user
+memory — which is why the chip disappears from the tag-type list when 2.000 is selected.
 
 ## Platform support
 
@@ -391,6 +467,15 @@ NFC modules as above.
 polkit is refusing the client. Add your user to the pcscd policy, or run
 `pcscd --disable-polkit` for a quick test.
 
+**`OpenTag3D 2.000 cannot be written to an NTAG213`**
+The 2.000 layout is 216 bytes; with NDEF framing that is 243 against an NTAG213's 144 bytes of
+user memory. The spec dropped the chip. Use an NTAG215 or NTAG216, or build the tag as 1.003.
+
+**`this module has field tables for 1.003 and 2.000 only`**
+The tag declares a version neither table covers. Check what `Read-OpenTag3DTag -Verbose`
+reports for the tag version; a newer minor release of a version the module knows parses
+anyway, with a warning.
+
 **`Profile name '...' is not usable`**
 Profile names become file names, so they are restricted to letters, digits, spaces, dots,
 dashes and underscores, up to 64 characters. Nothing that could point outside the profile
@@ -413,11 +498,15 @@ copy of the module is still on `$env:PSModulePath` — delete it and reinstall.
 
 ## Notes
 
-- The OpenTag3D field layout follows the published spec at
-  [opentag3d.info/spec.json](https://opentag3d.info/spec.json). The parser targets version
-  1.003: a newer minor version warns and parses anyway, a newer major version is refused.
-- The serial and tag version are displayed but not editable, enforced server-side as well
-  as in the UI.
+- Field layouts follow the published spec at
+  [opentag3d.info/spec.json](https://opentag3d.info/spec.json). The module carries a table
+  for 1.003 and one for 2.000, checked field by field against it. A payload declaring a
+  newer *minor* version of either parses anyway with a warning; a major version with no
+  table is refused rather than guessed at.
+- The tag version is never editable — it describes the format, not the filament, and the
+  module stamps it. The serial is locked on a payload that came from a lookup, since it is
+  the key the data came from, and editable on a hand-built tag, where it is the vendor's own
+  batch id. Both rules are enforced server-side, not just in the UI.
 - Page 3 is one-time programmable. The module only ever writes the capability container for
   the tag type it detected, and reads it back to confirm.
 - Reading and writing touch user memory only. The UID and the lock/configuration pages on a
